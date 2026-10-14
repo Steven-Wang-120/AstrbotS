@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from ..core.log import logger
@@ -18,6 +19,29 @@ from ..core.log import logger
 VALID_SCOPES = {"all", "containers", "qq", "ros2"}
 VALID_MODES = {"server", "ros2"}
 VALID_PROFILES = {"normal", "night", "maintenance", "aggressive"}
+
+
+def safe_int(value: Any, default: int = 0, *, low: int | None = None,
+             high: int | None = None) -> int:
+    """把 LLM/命令传来的数字安全地转成 int。
+
+    LLM 工具的参数类型是 `number`，而 JSON 允许 `Infinity` / `NaN` / `1e400`。
+    `int(float("inf"))` 抛的是 **OverflowError**（不是 ValueError），
+    `int(float("nan"))` 抛 ValueError。只捕 ValueError 会让 inf 直接击穿工具层
+    抛到 AstrBot，用户看到的是一个未处理的异常而不是可读回执。
+    """
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed):
+        return default
+    result = int(parsed)
+    if low is not None and result < low:
+        result = low
+    if high is not None and result > high:
+        result = high
+    return result
 
 
 def _admin_required(rt) -> bool:
@@ -57,11 +81,7 @@ def lifecycle_status(rt) -> str:
 
 
 def list_incidents(rt, limit: int = 10) -> str:
-    try:
-        limit = int(limit)
-    except (TypeError, ValueError):
-        limit = 10
-    return rt.incidents_text(limit)
+    return rt.incidents_text(safe_int(limit, 10, low=1, high=50))
 
 
 def diagnose(rt, target: str = "all") -> str:
@@ -92,11 +112,7 @@ async def run_check(rt, scope: str = "all") -> str:
 async def request_sleep(rt, reason: str, duration_min: float = 0,
                         is_admin: bool = False, armed: bool = False) -> str:
     """请求一次真睡眠（重启目标容器）。由 Bot 自主决定调用。"""
-    try:
-        dur = int(float(duration_min or 0))
-    except (TypeError, ValueError):
-        dur = 0
-    dur = max(0, min(120, dur))
+    dur = safe_int(duration_min, 0, low=0, high=120)
     reason = (reason or "Bot 自主请求休息").strip()[:200]
 
     if not rt.config.lifecycle.enabled:

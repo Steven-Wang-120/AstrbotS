@@ -177,6 +177,13 @@ class DockerClient:
                 body = await resp.read()
                 if resp.status >= 400:
                     raise DockerError(f"exec start -> {resp.status}", resp.status)
+        except asyncio.TimeoutError as exc:
+            # aiohttp 的总超时抛的是 asyncio.TimeoutError（3.11+ 即内置 TimeoutError），
+            # 它不是 aiohttp.ClientError 的子类；不单独捕获会让原始 TimeoutError
+            # 击穿"所有 Docker 失败都是 DockerUnavailable/DockerError"的契约，
+            # 使调用方（Ros2Runner / 探针）的降级分支失效。
+            raise DockerUnavailable(
+                f"exec 超时({timeout or self.timeout}s): {' '.join(cmd[:3])}") from exc
         except aiohttp.ClientError as exc:
             raise DockerUnavailable(f"exec 不可达: {exc}") from exc
         text = _demux(body)

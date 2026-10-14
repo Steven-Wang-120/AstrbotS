@@ -144,8 +144,10 @@ class LifecyclePolicy:
         #
         # force_on_deadline 只管辖"硬上限"这一条兜底路径，与等级自身的 action 无关：
         # 用户把某等级配成 force_sleep 是显式意图，不应被 deadline 开关关掉。
+        force_source = ""
         force_sleep = action == "force_sleep"
         if force_sleep:
+            force_source = "level"
             reason += " | level action=force_sleep"
             if not st.forced_at:
                 # 记录本次强制义务的起始时刻；on_sleep_done 会清零。
@@ -155,6 +157,7 @@ class LifecyclePolicy:
         if self.force_on_deadline and uptime_hours >= self.max_uptime_hours:
             force_sleep = True
             action = "force_sleep"
+            force_source = "deadline"
             if not st.forced_at:
                 st.forced_at = now
             reason += " | deadline reached"
@@ -177,6 +180,10 @@ class LifecyclePolicy:
             "inject_prompt": inject_prompt,
             "action": action,
             "force_sleep": force_sleep,
+            # "" | "level" | "deadline"：强制睡眠的**来源**。日志与审计必须能区分
+            # "某等级自己配了 force_sleep" 和 "到达 30 天硬上限"，否则运维无法
+            # 从记录里判断到底是哪条策略在要求睡眠。
+            "force_source": force_source,
             "reason": reason,
             "remaining_to_next": self.remaining_to_next(uptime_hours, idx),
             "remaining_to_deadline": self.remaining_to_deadline(uptime_hours),

@@ -282,7 +282,9 @@ class GuardianPlugin(Star):
         Args:
             limit(number): 返回条数，1-50，默认 10
         """
-        yield event.plain_result(llm_tools.list_incidents(self.runtime, int(limit)))
+        # 不要在这里 int(limit)：LLM 可能传 Infinity/NaN，int(float('inf')) 抛
+        # OverflowError。统一交给 llm_tools.safe_int 做有限性校验与夹取。
+        yield event.plain_result(llm_tools.list_incidents(self.runtime, limit))
 
     @filter.llm_tool()
     async def guardian_request_sleep(self, event: AstrMessageEvent, reason: str,

@@ -257,7 +257,14 @@ class HealthEngine:
     # ================================================================== #
     async def _lifecycle_tick(self, trigger: str) -> None:
         res = self._last_results.get("uptime:system")
-        if res is None or res.status == Status.UNKNOWN:
+        if res is None or res.status != Status.OK:
+            # 只有 Status.OK 的 uptime 才可信。
+            #
+            # - UNKNOWN：Docker 不可达/启动时间缺失，本来就没有依据。
+            # - WARN：`uptime` 探针只在"时钟回拨（容器启动时间在未来）"时给 WARN，
+            #   此时 metrics 里没有 uptime_hours；若照旧往下走会取到 0.0，把等级
+            #   静默降回 L0、清掉注入提示词，等时钟恢复正常后又重新注入一次。
+            #   宁可保持上一轮的可信等级不动。
             return
         uptime_h = float(res.metrics.get("uptime_hours", 0.0) or 0.0)
         now = time.time()
@@ -279,11 +286,19 @@ class HealthEngine:
             self.state.set("lifecycle.inject_prompt", "")
 
         if decision["force_sleep"]:
-            logger.warning(f"[guardian] 生命周期硬上限触发，强制睡眠：{decision['reason']}")
+            # 必须区分"等级自己配了 force_sleep"和"到达硬上限兜底"：两者都叫
+            # force_sleep，但归因完全不同，日志与审计若都写成"硬上限触发"，
+            # 运维就无法判断到底是哪条策略在要求睡眠。
+            source = decision.get("force_source") or "deadline"
+            source_txt = ("等级自身 action=force_sleep" if source == "level"
+                          else "到达硬上限兜底")
+            logger.warning(
+                f"[guardian] 生命周期强制睡眠（{source_txt}）：{decision['reason']}")
             await self.request_sleep(
-                reason=f"生命周期硬上限触发（{decision['reason']}）",
+                reason=f"生命周期强制睡眠（{source_txt}：{decision['reason']}）",
                 duration_min=self.config.lifecycle.sleep_duration_min,
-                actor="lifecycle", trigger="deadline", bypass_confirm=True)
+                actor="lifecycle",
+                trigger=source, bypass_confirm=True)
 
         self.state.set("lifecycle.state", self.lifecycle_state.to_dict())
 

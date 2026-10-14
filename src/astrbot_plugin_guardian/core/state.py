@@ -136,16 +136,29 @@ class StateStore:
         if not force and (now - self._last_flush) < self._flush_interval:
             return
         async with self._lock:
-            await asyncio.to_thread(self._write_atomic)
+            # 快照必须在**事件循环线程**里取。
+            #
+            # `_write_atomic` 经 `asyncio.to_thread` 在工作线程里执行；若让它自己
+            # 去遍历 `self._data`，而事件循环同时 `set()` 了新键（探针回调、
+            # 引擎记账都会做这件事），就会抛
+            # `RuntimeError: dictionary changed size during iteration`，
+            # 使整轮巡检以一条费解的报错失败、并丢掉这次状态落盘。
+            #
+            # 在事件循环线程里先构造好 payload（其间没有 await，不会被其他协程
+            # 插入），再把不可变的快照交给工作线程，即可根除该竞争。
+            payload = self.snapshot()
+            await asyncio.to_thread(self._write_atomic, payload)
             self._dirty = False
             self._last_flush = now
 
-    def _write_atomic(self) -> None:
+    def _write_atomic(self, payload: dict[str, Any] | None = None) -> None:
         self._ensure_dir()
+        if payload is None:  # 兼容直接调用（测试/诊断）
+            payload = self.snapshot()
         tmp = str(self.path) + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(self.snapshot(), fh, ensure_ascii=False, indent=1)
+                json.dump(payload, fh, ensure_ascii=False, indent=1)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)

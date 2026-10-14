@@ -64,13 +64,16 @@ bash tests/run_all.sh
 
 ## 自检结果
 
-`tests/` 下共 4 个自检脚本，覆盖核心逻辑、探针、插件装载与看门狗：
+`tests/` 下共 5 个自检脚本 + 1 个看门狗脚本，覆盖核心逻辑、探针、插件装载、
+内核解耦、对抗性边界与看门狗：
 
 | 脚本 | 覆盖 |
 | --- | --- |
 | `test_core_logic.py` | cron 解析、生命周期等级、配置校验、安全护栏、判定引擎、调度器、内存斜率 |
 | `test_probes_e2e.py` | 9 个探针 + 4 个动作 + 模式装配 + 通知器（使用 fixtures 假数据） |
 | `test_plugin_load.py` | 插件装载、命令/工具/钩子注册、提示词注入、硬上限睡眠、零关键词反证 |
+| `test_kernel_decoupling.py` | 内核侧模块不得 `import astrbot`（静态守卫 + 阻断 astrbot 的动态导入） |
+| `test_adversarial.py` | **对抗性边界**：非法/自相矛盾输入、状态竞争、非有限数值、归因正确性 |
 | `test_watchdog.sh` | 看门狗放行 / 白名单拒绝 / 过期拒绝 / 畸形忽略 / 失败记录 |
 
 运行：`bash tests/run_all.sh`（Python 自检需要 `aiohttp`）
