@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import time
 
-from astrbot.api import logger
+from ..core.log import logger
 
 from ..core.models import ActionResult, ActionSpec, Severity
 from ..utils.dockerclient import DockerError, DockerUnavailable

@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable
 
-from astrbot.api import logger
+from .log import logger
 
 JobFunc = Callable[[], Awaitable[Any] | Any]
 

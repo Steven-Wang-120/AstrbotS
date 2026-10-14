@@ -9,7 +9,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 
-from astrbot.api import logger
+from ..core.log import logger
 
 
 @dataclass

@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from astrbot.api import logger
+from .log import logger
 
 SENSITIVE_KEYS = {"access_token", "token", "webui_token", "authorization", "password", "secret"}
 MAX_BYTES = 8 * 1024 * 1024  # 8MB 轮转

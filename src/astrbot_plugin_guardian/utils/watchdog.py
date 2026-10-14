@@ -31,6 +31,10 @@ async def submit_sleep(engine, spec: ActionSpec, targets: list[str], duration: i
     pending = {"nonce": nonce, "targets": targets, "ts": payload["ts"], "operation": "sleep"}
     engine.state.set("watchdog.pending", pending)
     # Commit before publishing: the host could stop this process immediately.
+    # Snapshot the accounting keys first so a publication that never becomes visible
+    # can be corrected into an honest failure instead of leaving a fake success
+    # (which would silently reset the targets' fail streaks).
+    accounting = engine.state.capture(("cooldowns", "action_history", "fail_streak"))
     engine.safety.commit(spec, True)
     spec.params["_watchdog_committed"] = True
     await engine.state.flush(force=True)
@@ -69,7 +73,14 @@ async def submit_sleep(engine, spec: ActionSpec, targets: list[str], duration: i
         await asyncio.to_thread(publish)
     except Exception as exc:
         if not published:
+            # Nothing reached the host. Undo the optimistic success accounting and
+            # record a real failure: an unpublished request must not reset the
+            # targets' fail streaks, and the quota/cooldown it consumed stays
+            # consumed (same policy as any other failed real action) so a broken
+            # host handoff degrades to alert-only instead of looping.
             engine.state.set("watchdog.pending", None)
+            engine.state.restore(accounting)
+            engine.safety.commit(spec, False)
             await engine.state.flush(force=True)
         raise DockerError(f"宿主机请求提交{'后落盘确认' if published else ''}失败：{exc}；{'保留待确认任务' if published else '未发布请求'}") from exc
     return nonce

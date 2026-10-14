@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 import types
 from datetime import datetime
 
@@ -199,6 +200,86 @@ def test_arm_sleep_and_force_sleep():
     assert d2["force_sleep"] is True and d2["action"] == "force_sleep"
 
 
+def _custom_policy(levels, **kw):
+    specs = [LevelSpec.from_dict(x) for x in levels]
+    return LifecyclePolicy(specs, **kw)
+
+
+def test_custom_force_level_is_authoritative_before_deadline():
+    """用户批准的语义：等级自身 action=force_sleep 即权威，硬上限之前就生效。
+
+    修复前 `force_sleep` 只在 max_uptime_hours 分支被置真，于是自定义等级
+    （阈值 < 硬上限）虽然 action 是 force_sleep，引擎却收不到强制信号——
+    表现为"配了强制等级却什么也不做"。
+    """
+    p = _custom_policy([
+        {"id": "L0", "name": "常规", "after_hours": 0, "action": "none"},
+        {"id": "L1", "name": "自定义强制", "after_hours": 10,
+         "prompt": "该休息了", "action": "force_sleep"},
+    ], max_uptime_hours=720.0, force_on_deadline=True)
+
+    st = LifecycleState()
+    d = p.evaluate(11.0, st, now=1.0)          # 11h：已过 L1(10h)，远低于 720h
+    assert d["action"] == "force_sleep"
+    assert d["force_sleep"] is True, "自定义强制等级必须在硬上限之前生效"
+    assert "level action=force_sleep" in d["reason"]
+    # 义务起始时刻被记录（供运维追溯），且不会随每次巡检被反复刷新
+    assert st.forced_at == 1.0
+    d2 = p.evaluate(12.0, st, now=99.0)
+    assert st.forced_at == 1.0, "forced_at 应记录义务起点而非最后一次评估时间"
+
+    # 阈值以下不得强制
+    d3 = p.evaluate(9.9, LifecycleState(), now=1.0)
+    assert d3["force_sleep"] is False and d3["action"] == "none"
+
+
+def test_force_level_is_independent_of_deadline_switch():
+    """force_on_deadline 只管"硬上限"兜底，不应关掉用户显式配置的强制等级。"""
+    p = _custom_policy([
+        {"id": "L0", "name": "常规", "after_hours": 0, "action": "none"},
+        {"id": "L1", "name": "强制", "after_hours": 5, "action": "force_sleep"},
+    ], max_uptime_hours=1000.0, force_on_deadline=False)
+    assert p.evaluate(6.0, LifecycleState(), now=1.0)["force_sleep"] is True
+    # 硬上限已关闭：即使超过 max_uptime_hours 也不因 deadline 强制
+    d = p.evaluate(1500.0, LifecycleState(), now=1.0)
+    assert "deadline reached" not in d["reason"]
+
+
+def test_deadline_still_forces_without_any_force_level():
+    """兜底路径不能因为改造而失效：最高等级只是 notify，到硬上限仍须强制。"""
+    p = _custom_policy([
+        {"id": "L0", "name": "常规", "after_hours": 0, "action": "none"},
+        {"id": "L1", "name": "提醒", "after_hours": 10, "action": "notify"},
+    ], max_uptime_hours=100.0, force_on_deadline=True)
+    d = p.evaluate(100.0, LifecycleState(), now=1.0)
+    assert d["force_sleep"] is True and d["action"] == "force_sleep"
+    assert "deadline reached" in d["reason"]
+
+
+def test_forced_at_cleared_only_by_sleep_completion():
+    p = _custom_policy([
+        {"id": "L0", "name": "常规", "after_hours": 0, "action": "none"},
+        {"id": "L1", "name": "强制", "after_hours": 10, "action": "force_sleep"},
+    ], max_uptime_hours=720.0)
+    st = LifecycleState()
+    p.evaluate(11.0, st, now=50.0)
+    assert st.forced_at == 50.0
+    p.on_sleep_done(st, now=60.0)
+    assert st.forced_at == 0.0, "一次成功睡眠必须结清强制义务"
+    assert st.uptime_hours == 0.0 and st.level_id == "L0"
+
+
+def test_describe_surfaces_outstanding_force_obligation():
+    p = _custom_policy([
+        {"id": "L0", "name": "常规", "after_hours": 0, "action": "none"},
+        {"id": "L1", "name": "强制", "after_hours": 10, "action": "force_sleep"},
+    ], max_uptime_hours=720.0)
+    st = LifecycleState()
+    assert "强制义务" not in p.describe(st)
+    p.evaluate(11.0, st, now=time.time())
+    assert "强制义务始于" in p.describe(st)
+
+
 def test_sleep_done_resets_state():
     p = make_policy()
     st = LifecycleState()
@@ -332,6 +413,57 @@ def test_sleep_rejects_bad_group_and_bad_duration_before_actions():
     assert not guard.authorize(ActionSpec("sleep", "napcat", {"targets": ["napcat", "evil"]})).allowed
     guard.state.set("watchdog.pending", {"targets": ["napcat"]})
     assert guard.authorize(ActionSpec("restart_container", "napcat")).code == "watchdog_pending"
+
+
+def test_qq_relogin_blocked_while_watchdog_owns_napcat():
+    """qq_relogin 逻辑目标是 "qq"，物理上却会重启 NapCat。
+
+    看门狗正在持有 NapCat（睡眠/重启中）时，绝不能再由插件去重启它。
+    修复前归属检查拿 "qq" 去比对容器名列表，永远匹配不上，于是形成冲突通道。
+    """
+    cfg = make_config(dry_run=False,
+                      containers={"astrbot": "astrbot", "napcat": "napcat",
+                                  "managed": ["astrbot", "napcat"]},
+                      safety={"allow_self_restart": True})
+    st = FakeState()
+    guard = SafetyGuard(cfg, st, FakeAudit())
+    st.set("watchdog.pending", {"nonce": "n1", "targets": ["napcat"], "operation": "sleep"})
+
+    d = guard.authorize(ActionSpec("qq_relogin", "qq", {"reason": "offline"}), now=5000.0)
+    assert not d.allowed and d.code == "watchdog_pending", f"{d.allowed}/{d.code}"
+
+    # 看门狗持有的不是 NapCat -> 不应误伤
+    st.set("watchdog.pending", {"nonce": "n2", "targets": ["astrbot"], "operation": "sleep"})
+    assert guard.authorize(ActionSpec("qq_relogin", "qq", {}), now=5000.0).allowed
+
+    # webui_quick_login 不重启容器 -> 不应被 NapCat 归属挡住
+    cfg.raw["qq"]["relogin_method"] = "webui_quick_login"
+    cfg.raw["qq"]["webui_base"] = "http://napcat:6099"
+    cfg.refresh()
+    st.set("watchdog.pending", {"nonce": "n3", "targets": ["napcat"], "operation": "sleep"})
+    assert guard.authorize(ActionSpec("qq_relogin", "qq", {}), now=5000.0).allowed
+
+
+def test_qq_relogin_cooldown_uses_physical_napcat():
+    """NapCat 刚被重启过时，qq_relogin 不该再立刻重启它一次。"""
+    cfg = make_config(dry_run=False,
+                      containers={"astrbot": "astrbot", "napcat": "napcat",
+                                  "managed": ["astrbot", "napcat"]},
+                      safety={"allow_self_restart": True, "action_cooldown_sec": 600})
+    st = FakeState()
+    guard = SafetyGuard(cfg, st, FakeAudit())
+
+    st.bump_cooldown("napcat", 1000.0)
+    d = guard.authorize(ActionSpec("qq_relogin", "qq", {}), now=1100.0)
+    assert not d.allowed and d.code == "cooldown", f"{d.allowed}/{d.code}"
+    # 冷却到期后放行
+    assert guard.authorize(ActionSpec("qq_relogin", "qq", {}), now=1700.0).allowed
+
+    # 记账也必须落在物理目标上，否则下一次冷却检查看不到
+    st.set("cooldowns", {})
+    guard.commit(ActionSpec("qq_relogin", "qq", {}), ok=True)
+    assert st.cooldown_of("napcat") > 0, "qq_relogin 的冷却必须记在 napcat 上"
+    assert len(st.d["action_history"]) == 1
 
 
 def test_validate_target():

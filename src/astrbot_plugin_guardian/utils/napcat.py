@@ -13,7 +13,7 @@ from typing import Any, Awaitable, Callable
 
 import aiohttp
 
-from astrbot.api import logger
+from ..core.log import logger
 
 
 class NapCatError(RuntimeError):

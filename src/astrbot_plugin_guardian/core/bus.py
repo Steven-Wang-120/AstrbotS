@@ -9,7 +9,7 @@ import asyncio
 from collections import defaultdict
 from typing import Any, Awaitable, Callable
 
-from astrbot.api import logger
+from .log import logger
 
 Handler = Callable[[str, dict[str, Any]], Awaitable[None]]
 

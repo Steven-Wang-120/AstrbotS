@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from astrbot.api import logger
+from ..core.log import logger
 
 VALID_SCOPES = {"all", "containers", "qq", "ros2"}
 VALID_MODES = {"server", "ros2"}

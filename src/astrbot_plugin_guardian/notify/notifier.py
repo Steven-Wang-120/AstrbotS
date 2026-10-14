@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from astrbot.api import logger
+from ..core.log import logger
 
 from ..core.models import Incident, Severity, severity_at_least
 from ..utils.textutil import mask_umo, truncate

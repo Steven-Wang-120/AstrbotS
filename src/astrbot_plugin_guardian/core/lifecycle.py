@@ -135,10 +135,28 @@ class LifecyclePolicy:
         action = spec.action or "none"
         reason = f"uptime={uptime_hours:.1f}h -> {spec.id}({spec.name})"
 
-        force_sleep = False
+        # 用户已批准的语义（B15）：被选中的等级若 action="force_sleep"，该等级即为权威，
+        # 一旦 uptime 达到该等级阈值就立即强制睡眠——不必等到 max_uptime_hours。
+        #
+        # 注意这**不绕过任何安全门**：白名单、每小时配额、看门狗待确认归属、本体容器
+        # 权限，全部仍由 SafetyGuard 在真正执行前判定。"权威"只表示策略层不再压着
+        # 不发指令，而不是说策略层可以越过安全层。
+        #
+        # force_on_deadline 只管辖"硬上限"这一条兜底路径，与等级自身的 action 无关：
+        # 用户把某等级配成 force_sleep 是显式意图，不应被 deadline 开关关掉。
+        force_sleep = action == "force_sleep"
+        if force_sleep:
+            reason += " | level action=force_sleep"
+            if not st.forced_at:
+                # 记录本次强制义务的起始时刻；on_sleep_done 会清零。
+                st.forced_at = now
+
+        # 硬上限兜底：即便最高等级没有配 force_sleep，到达 max_uptime_hours 也必须强制。
         if self.force_on_deadline and uptime_hours >= self.max_uptime_hours:
             force_sleep = True
             action = "force_sleep"
+            if not st.forced_at:
+                st.forced_at = now
             reason += " | deadline reached"
 
         inject_prompt = None
@@ -179,11 +197,17 @@ class LifecyclePolicy:
         nxt = self.next_level(st.level_index)
         nxt_txt = (f"{nxt.name}（还有 {self.remaining_to_next(st.uptime_hours, st.level_index):.1f}h）"
                    if nxt else "已是最高等级")
+        # 强制义务是"已发出但尚未由一次成功睡眠结清"的状态，必须能被运维看见，
+        # 否则自定义 force_sleep 等级触发了什么、什么时候触发的都无从追溯。
+        forced_txt = ""
+        if st.forced_at:
+            forced_txt = (" | 强制义务始于 "
+                          + time.strftime("%Y-%m-%d %H:%M", time.localtime(st.forced_at)))
         return (
             f"运行时长 {st.uptime_hours:.1f}h（{st.uptime_hours / 24:.1f} 天） | "
             f"等级 {st.level_id} {st.level_name} | 下一级 {nxt_txt} | "
             f"距硬上限 {self.remaining_to_deadline(st.uptime_hours):.1f}h | "
-            f"武装睡眠 {'是' if st.sleep_armed else '否'}"
+            f"武装睡眠 {'是' if st.sleep_armed else '否'}{forced_txt}"
         )
 
 

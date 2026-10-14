@@ -14,7 +14,7 @@ from __future__ import annotations
 import shlex
 from dataclasses import dataclass
 
-from astrbot.api import logger
+from ..core.log import logger
 
 from ..core.safety import ALLOWED_COMMAND_PREFIXES, validate_command
 from .dockerclient import DockerClient, DockerError, DockerUnavailable

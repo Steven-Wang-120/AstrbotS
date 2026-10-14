@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 import types
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -600,6 +601,149 @@ def test_nonself_sleep_start_failure_is_not_success():
         assert calls == [("stop", "napcat"), ("start", "napcat")]
         assert rt.engine.lifecycle_state.last_sleep_at == before
     run(main())
+
+
+def test_custom_force_level_triggers_sleep_before_deadline():
+    """自定义等级 action=force_sleep 必须在硬上限之前就让引擎真的发出睡眠请求。
+
+    修复前策略层返回的 force_sleep 恒为 False（只在 max_uptime_hours 分支置真），
+    于是自定义强制等级只会注入提示词，永远不会触发睡眠——"配了却不生效"。
+    """
+    from astrbot_plugin_guardian.core.lifecycle import LifecycleState, build_policy
+    from astrbot_plugin_guardian.core.models import ProbeResult, Severity, Status
+
+    async def main():
+        p, _ctx = make_plugin()
+        rt = p.runtime
+        rt.config.raw["lifecycle"]["levels"] = [
+            {"id": "L0", "name": "常规", "after_hours": 0, "prompt": "", "action": "none"},
+            {"id": "L1", "name": "自定义强制", "after_hours": 10,
+             "prompt": "该休息了", "action": "force_sleep"},
+        ]
+        rt.config.refresh()
+        rt.lifecycle_policy = build_policy(rt.config)
+        rt.engine.lifecycle_policy = rt.lifecycle_policy
+        rt.engine.lifecycle_state = LifecycleState()
+
+        calls: list[dict] = []
+
+        async def spy(**kw):
+            calls.append(kw)
+            return True, "[dry-run]"
+
+        rt.engine.request_sleep = spy
+        rt.engine._last_results = {"uptime:system": ProbeResult(
+            "uptime", "system", Status.OK, Severity.INFO, "up", {"uptime_hours": 11.0})}
+
+        await rt.engine._lifecycle_tick("interval")
+        assert len(calls) == 1, f"自定义强制等级应发出睡眠请求，实际 {len(calls)} 次"
+        assert calls[0]["actor"] == "lifecycle"
+        assert "force_sleep" in calls[0]["reason"], calls[0]["reason"]
+        assert rt.engine.lifecycle_state.forced_at > 0
+
+        # 阈值以下（9h < 10h）不得触发
+        rt.engine.lifecycle_state = LifecycleState()
+        rt.engine._last_results["uptime:system"] = ProbeResult(
+            "uptime", "system", Status.OK, Severity.INFO, "up", {"uptime_hours": 9.0})
+        await rt.engine._lifecycle_tick("interval")
+        assert len(calls) == 1, "未达阈值不得触发强制睡眠"
+
+    run(main())
+
+
+def test_failed_watchdog_publication_records_failure_not_success():
+    """发布失败 = 动作从未到达宿主机：必须如实记失败，不能把目标失败连击清零。
+
+    submit_sleep 为了"宿主机可能立刻杀掉本进程"而在发布前先记账，
+    但修复前用的是 commit(spec, True)——于是发布失败也被记成成功，
+    目标的 fail_streak 被静默清零，连续失败降级机制失效。
+    """
+    import tempfile
+    from pathlib import Path
+    from astrbot_plugin_guardian.core.state import StateStore
+
+    async def main():
+        with tempfile.TemporaryDirectory(dir=os.path.join(HERE, "_tmp")) as directory:
+            p, _ctx = make_plugin()
+            rt = p.runtime
+            state = StateStore(directory)
+            state.load()
+            rt.state = rt.safety.state = rt.engine.state = state
+            rt.config.raw["dry_run"] = False
+            rt.config.raw["safety"]["allow_self_restart"] = True
+            request = Path(directory) / "request.json"
+            request.write_text("queued request")     # 触发 no-clobber 失败
+            rt.config.raw["safety"]["watchdog_request_path"] = str(request)
+            rt.config.raw["lifecycle"]["sleep_targets"] = ["astrbot", "napcat"]
+            rt.config.refresh()
+            state.set("fail_streak", {"astrbot": 2, "napcat": 2})
+
+            ok, detail = await rt.request_sleep("fail-path", 1)
+            assert not ok and "提交失败" in detail, detail
+            assert state.get("watchdog.pending") is None
+            assert request.read_text() == "queued request", "不得覆盖排队中的请求"
+            # 失败必须登记：2 -> 3，而不是被乐观记账清零
+            assert state.get("fail_streak") == {"astrbot": 3, "napcat": 3}, \
+                state.get("fail_streak")
+            # 一次真实动作尝试消耗一个配额，并对物理目标加冷却；且不得重复记账
+            assert state.actions_in_window(1800) == 1, state.actions_in_window(1800)
+            assert state.cooldown_of("astrbot") > 0 and state.cooldown_of("napcat") > 0
+
+    run(main())
+
+
+def test_cancelled_publication_keeps_pending_obligation():
+    """发布期间被取消：无法确定请求是否落盘，必须保守保留待确认义务。
+
+    这是刻意的保守行为——宁可留下一个需要人工/超时确认的 pending，
+    也不能因为"没等到结果"就假定什么都没发生（可能宿主机已经接手）。
+    """
+    import tempfile
+    from pathlib import Path
+    from unittest import mock
+    from astrbot_plugin_guardian.core.state import StateStore
+
+    def slow_link(src, dst):
+        time.sleep(0.5)          # 让线程真正进入"发布中"，再制造取消窗口
+        raise OSError("simulated link failure")
+
+    async def main():
+        with tempfile.TemporaryDirectory(dir=os.path.join(HERE, "_tmp")) as directory:
+            p, _ctx = make_plugin()
+            rt = p.runtime
+            state = StateStore(directory)
+            state.load()
+            rt.state = rt.safety.state = rt.engine.state = state
+            rt.config.raw["dry_run"] = False
+            rt.config.raw["safety"]["allow_self_restart"] = True
+            request = Path(directory) / "request.json"
+            rt.config.raw["safety"]["watchdog_request_path"] = str(request)
+            rt.config.raw["lifecycle"]["sleep_targets"] = ["astrbot", "napcat"]
+            rt.config.refresh()
+
+            with mock.patch("os.link", slow_link):
+                task = asyncio.create_task(rt.request_sleep("cancel-path", 1))
+                await asyncio.sleep(0.15)     # 发布线程已启动
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            assert not request.exists(), "发布未完成，请求文件不应出现"
+            assert state.get("watchdog.pending") is not None, \
+                "取消后必须保守保留待确认义务，不能假定什么都没发生"
+            assert state.get("watchdog.pending")["targets"] == ["astrbot", "napcat"]
+
+    run(main())
+
+
+def test_log_facade_forwards_to_astrbot_when_present():
+    """在 AstrBot 内运行时，日志门面必须转发给 astrbot.api.logger（行为不变）。"""
+    from astrbot_plugin_guardian.core.log import in_astrbot, logger
+    import astrbot.api as host_api
+    assert in_astrbot is True, "桩环境下门面应识别到 astrbot"
+    assert logger is host_api.logger, "门面必须转发到宿主 logger，而不是自建一个"
 
 
 def _run_all() -> int:

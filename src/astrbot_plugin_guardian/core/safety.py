@@ -14,7 +14,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-from astrbot.api import logger
+from .log import logger
 
 from .models import ActionSpec
 
@@ -128,6 +128,28 @@ class SafetyGuard:
         return warns
 
     # ------------------------------------------------------------------ #
+    def _physical_targets(self, action: ActionSpec) -> list[str]:
+        """逻辑目标动作实际会触碰的物理容器名。
+
+        `qq_relogin` 的逻辑目标恒为 "qq"，但按 `qq.relogin_method` 可能真的去重启
+        NapCat 容器。宿主机看门狗归属与冷却必须按**物理目标**判定，否则会出现
+        "看门狗正持有 NapCat（正在睡眠/重启中），插件同时又去重启 NapCat" 的冲突。
+
+        - restart_container：触碰 `containers.napcat`
+        - webui_quick_login / disabled：不触碰容器
+        - ros2_restart：作用于 ROS2 节点而非容器，返回空（回落为按节点名记账）
+        """
+        cfg = self.config
+        if action.kind == "qq_relogin":
+            method = str(cfg.qq.relogin_method or "").strip()
+            if method != "restart_container":
+                return []
+            napcat = str(cfg.containers.get("napcat") or "").strip()
+            return [napcat] if napcat else []
+        if action.kind in LOGICAL_TARGET_KINDS:
+            return []
+        return [action.target]
+
     def _authorize_logical_target(self, action: ActionSpec) -> Decision | None:
         """逻辑目标动作（qq_relogin / ros2_restart）的独立授权校验。
 
@@ -199,8 +221,11 @@ class SafetyGuard:
                             "熔断已触发（动作次数超限或连续失败），仅告警模式",
                             "circuit_open")
 
+        # 归属判定按物理目标：qq_relogin 物理上会重启 NapCat，若宿主机看门狗正持有
+        # NapCat，就必须拒绝，不能因为逻辑目标叫 "qq" 而放行。
+        physical = self._physical_targets(action)
         pending = self.state.get("watchdog.pending") or {}
-        if action.target in pending.get("targets", []):
+        if set(physical) & set(pending.get("targets") or []):
             return Decision(False, False, "目标仍由宿主机看门狗持有，等待执行结果", "watchdog_pending")
 
         # 参数规范化
@@ -232,10 +257,13 @@ class SafetyGuard:
                                     "protected")
 
         # 冷却（last == 0 表示从未动作过，不参与冷却判断）
+        # 同样按物理目标取冷却：qq_relogin 重启的是 NapCat，就该受 NapCat 的冷却约束，
+        # 否则"刚重启完 NapCat"和"QQ 掉线重登再重启 NapCat"会互相绕过。
         cooldown = float(cfg.safety.action_cooldown_sec or 0)
         if action.params.get("cooldown_key") == "memory_leak":
             cooldown = max(cooldown, float(cfg.memory.leak_cooldown or 0))
-        last = self.state.cooldown_of(action.target)
+        cool_targets = physical or [action.target]
+        last = max((self.state.cooldown_of(t) for t in cool_targets), default=0.0)
         if cooldown > 0 and last > 0 and (now - last) < cooldown:
             remain = int(cooldown - (now - last))
             return Decision(False, False,
@@ -271,7 +299,12 @@ class SafetyGuard:
         """
         if action.dry_run:
             return
-        targets = action.params.get("targets", [action.target]) if action.kind == "sleep" else [action.target]
+        if action.kind == "sleep":
+            targets = list(action.params.get("targets", [action.target]))
+        else:
+            # 逻辑目标动作按物理容器记账（qq_relogin -> napcat）：否则冷却与失败连击
+            # 会记在 "qq" 上，与容器级动作互相看不见，形成绕过通道。
+            targets = self._physical_targets(action) or [action.target]
         self.state.record_action()  # One authorized group request consumes one action quota.
         for target in targets:
             self.state.bump_cooldown(target)

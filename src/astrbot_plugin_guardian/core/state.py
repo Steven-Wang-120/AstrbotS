@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import os
 import shutil
@@ -18,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from astrbot.api import logger
+from .log import logger
 
 SCHEMA_VERSION = 2
 
@@ -108,6 +109,24 @@ class StateStore:
     def snapshot(self) -> dict[str, Any]:
         """返回仅含持久化键的浅拷贝，供展示与落盘。"""
         return {k: v for k, v in self._data.items() if k in PERSISTED_KEYS or k == "schema"}
+
+    # ---- 回滚支持 ----------------------------------------------------- #
+    def capture(self, keys: tuple[str, ...]) -> dict[str, Any]:
+        """深拷贝指定键的当前值，供"乐观记账后失败"的场景回滚。
+
+        典型用法：宿主机交接必须在发布前先记账（否则进程被宿主机杀掉就丢了动作记录），
+        但发布可能失败。失败时用本快照还原，避免把一次没发生的动作记成成功。
+        """
+        return {k: copy.deepcopy(self._data.get(k)) for k in keys}
+
+    def restore(self, snapshot: dict[str, Any]) -> None:
+        """把 capture() 的快照写回；快照值为 None 的键会被删除。"""
+        for key, value in snapshot.items():
+            if value is None:
+                self._data.pop(key, None)
+            else:
+                self._data[key] = copy.deepcopy(value)
+        self._dirty = True
 
     # ------------------------------------------------------------------ #
     async def flush(self, force: bool = False) -> None:

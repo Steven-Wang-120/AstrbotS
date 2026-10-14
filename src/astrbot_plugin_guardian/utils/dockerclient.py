@@ -13,7 +13,7 @@ import json
 from typing import Any
 
 import aiohttp
-from astrbot.api import logger
+from ..core.log import logger
 
 
 class DockerUnavailable(RuntimeError):
