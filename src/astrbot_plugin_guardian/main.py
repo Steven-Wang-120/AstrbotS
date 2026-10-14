@@ -211,7 +211,7 @@ class GuardianPlugin(Star):
             if len(args) < 2:
                 return f"用法：/guardian restart <容器>。允许：{', '.join(rt.allowlist()) or '(白名单为空)'}"
             return await llm_tools.restart_container(
-                rt, args[1], reason="管理员手动重启", is_admin=True)
+                rt, args[1], reason="管理员手动重启", is_admin=True, confirm=True)
         if sub == "incidents":
             limit = 10
             if len(args) > 1:
@@ -288,36 +288,45 @@ class GuardianPlugin(Star):
 
     @filter.llm_tool()
     async def guardian_request_sleep(self, event: AstrMessageEvent, reason: str,
-                                     duration_min: float = 0):
+                                     duration_min: float = 0,
+                                     confirm: bool = False):
         """请求让自己"睡一觉"——即执行一次真实的容器重启维护，服务会短暂中断后恢复。
 
         这是你（Bot）自主决定休息的方式。当系统已连续运行很久、或你自己觉得
         需要一次彻底休息/重置时，可以主动调用本工具。
         注意：不要因为用户随口提到"睡觉"就调用；应由你自己判断是否真的需要休息。
+        破坏性二次确认：首次调用（confirm=false）只返回确认提示，不执行；
+        你确认无误后再次调用并置 confirm=true 才会真正执行。
 
         Args:
             reason(string): 请求休息的原因，会记录到审计日志并告知用户
             duration_min(number): 期望离线时长（分钟），0-120，0 表示立即重启恢复
+            confirm(boolean): 二次确认标志，true 才真正执行，默认 false
         """
         armed = bool(self.runtime.engine.lifecycle_state.sleep_armed)
         text = await llm_tools.request_sleep(
             self.runtime, reason, duration_min,
-            is_admin=event.is_admin(), armed=armed)
+            is_admin=event.is_admin(), armed=armed, confirm=confirm)
         yield event.plain_result(text)
 
     @filter.llm_tool()
     async def guardian_restart_container(self, event: AstrMessageEvent,
-                                         container: str, reason: str = ""):
+                                         container: str, confirm: bool = False,
+                                         reason: str = ""):
         """重启一个受管容器（破坏性操作，需要管理员权限，且容器必须在白名单内）。
 
         仅在用户明确要求重启、或你确认必须重启时调用。
+        首次调用（confirm=false）只返回确认提示，不执行动作；确认无误后
+        再次调用并置 confirm=true 才会真正执行。
 
         Args:
             container(string): 容器名，必须在动作白名单内（例如 astrbot、napcat）
+            confirm(boolean): 二次确认标志，true 才真正执行，默认 false
             reason(string): 重启原因
         """
         yield event.plain_result(await llm_tools.restart_container(
-            self.runtime, container, reason, is_admin=event.is_admin()))
+            self.runtime, container, reason, is_admin=event.is_admin(),
+            confirm=confirm))
 
     @filter.llm_tool()
     async def guardian_set_mode(self, event: AstrMessageEvent, mode: str):

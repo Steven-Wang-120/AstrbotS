@@ -416,7 +416,8 @@ def test_sleep_denied_when_no_usable_target():
         rt = p.runtime
         rt.config.raw["safety"]["allowed_containers"] = []
         rt.config.raw["containers"]["managed"] = []
-        ok, detail = await rt.request_sleep("测试", 0, actor="llm", trigger="llm")
+        ok, detail = await rt.request_sleep("测试", 0, actor="llm", trigger="llm",
+                                            bypass_confirm=True)
         assert ok is False
         assert "allow_self_restart" in detail
 
@@ -519,7 +520,7 @@ def test_host_sleep_handoff_persists_and_does_not_mark_completed():
             async def forbidden(*args, **kwargs):
                 raise AssertionError("self sleep must never call plugin Docker")
             rt.docker.stop = rt.docker.start = rt.docker.restart = forbidden
-            ok, detail = await rt.request_sleep("host test", 1)
+            ok, detail = await rt.request_sleep("host test", 1, bypass_confirm=True)
             assert ok and "尚未确认" in detail
             payload = json.loads(request.read_text(encoding="utf-8"))
             assert payload["version"] == 2 and payload["targets"] == ["astrbot", "napcat"]
@@ -530,7 +531,7 @@ def test_host_sleep_handoff_persists_and_does_not_mark_completed():
             assert set(state.get("cooldowns")) == {"astrbot", "napcat"}
             assert len(state.get("action_history")) == 1
             assert rt.engine.lifecycle_state.last_sleep_at == 0
-            assert not (await rt.request_sleep("duplicate", 1))[0]
+            assert not (await rt.request_sleep("duplicate", 1, bypass_confirm=True))[0]
             result.write_text(json.dumps({"nonce": "other", "status": "completed", "ok": True,
                                           "targets": payload["targets"], "operation": "sleep"}))
             await reconcile(rt.engine)
@@ -566,7 +567,7 @@ def test_host_submission_never_overwrites_queued_request():
             rt.config.raw["safety"]["watchdog_request_path"] = str(request)
             rt.config.raw["lifecycle"]["sleep_targets"] = ["astrbot", "napcat"]
             rt.config.refresh()
-            ok, detail = await rt.request_sleep("no clobber", 1)
+            ok, detail = await rt.request_sleep("no clobber", 1, bypass_confirm=True)
             assert not ok and "提交失败" in detail
             assert request.read_text() == "original queued request"
             assert state.get("watchdog.pending") is None
@@ -596,7 +597,7 @@ def test_nonself_sleep_start_failure_is_not_success():
         rt.docker.stop, rt.docker.start = stop, start
         before = rt.engine.lifecycle_state.last_sleep_at
         with patch("astrbot_plugin_guardian.actions.sleep.asyncio.sleep", no_wait):
-            ok, detail = await rt.request_sleep("failure", 1)
+            ok, detail = await rt.request_sleep("failure", 1, bypass_confirm=True)
         assert not ok and "恢复失败" in detail
         assert calls == [("stop", "napcat"), ("start", "napcat")]
         assert rt.engine.lifecycle_state.last_sleep_at == before
@@ -678,7 +679,7 @@ def test_failed_watchdog_publication_records_failure_not_success():
             rt.config.refresh()
             state.set("fail_streak", {"astrbot": 2, "napcat": 2})
 
-            ok, detail = await rt.request_sleep("fail-path", 1)
+            ok, detail = await rt.request_sleep("fail-path", 1, bypass_confirm=True)
             assert not ok and "提交失败" in detail, detail
             assert state.get("watchdog.pending") is None
             assert request.read_text() == "queued request", "不得覆盖排队中的请求"
@@ -722,7 +723,8 @@ def test_cancelled_publication_keeps_pending_obligation():
             rt.config.refresh()
 
             with mock.patch("os.link", slow_link):
-                task = asyncio.create_task(rt.request_sleep("cancel-path", 1))
+                task = asyncio.create_task(
+                    rt.request_sleep("cancel-path", 1, bypass_confirm=True))
                 await asyncio.sleep(0.15)     # 发布线程已启动
                 task.cancel()
                 try:

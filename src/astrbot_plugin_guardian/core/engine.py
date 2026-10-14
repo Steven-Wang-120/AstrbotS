@@ -172,7 +172,6 @@ class HealthEngine:
                                trigger: str) -> list[Incident]:
         incidents: list[Incident] = []
         last_status: dict[str, str] = dict(self.state.get("last_status") or {})
-        profile = self.state.get("profile") or self.config.profile
         to_notify: list[Incident] = []
 
         for finding in findings:
@@ -200,6 +199,11 @@ class HealthEngine:
                 message=finding.reason, trigger=trigger)
 
             # 动作（maintenance 档位不动作）
+            #
+            # profile 必须**每轮重新读取**：本轮前面的动作可能刚因连续失败把档位
+            # 自动降级为 maintenance（B00 §10.6）。若沿用循环开始时的旧值，
+            # 降级后同一趟巡检里剩余的 finding 仍会继续执行破坏性动作。
+            profile = self.state.get("profile") or self.config.profile
             if finding.suggested_action is not None and profile != "maintenance":
                 spec = finding.suggested_action
                 spec.actor = "system"
@@ -243,7 +247,8 @@ class HealthEngine:
         result = await action.execute(spec)
         inc.result = result
         if not spec.params.get("_watchdog_committed"):
-            self.safety.commit(spec, result.ok)
+            degraded = self.safety.commit(spec, result.ok)
+            await self._note_degradation(degraded, trigger)
         self.audit.append(
             kind="action.execute", target=spec.target,
             detail=f"{spec.kind} -> {result.detail}",
@@ -251,6 +256,32 @@ class HealthEngine:
             elapsed_ms=result.elapsed_ms, params=spec.params)
         await self.bus.publish("action.done", {"spec": spec.to_dict(),
                                               "result": result.to_dict()})
+
+    # ================================================================== #
+    # 连续失败自动降级（B00 §10.6）
+    # ================================================================== #
+    async def _note_degradation(self, degraded: list[tuple[str, int]],
+                                trigger: str = "") -> None:
+        """把"连续失败达阈值"落实为：只告警 + 进入 maintenance 档位。
+
+        safety 层已保证同一目标只在**恰好跨过阈值**时上报一次；这里再做一次
+        幂等保护：已经处于 maintenance 就只补审计与通知，不重复切换档位。
+        """
+        if not degraded:
+            return
+        targets = ", ".join(f"{t}(x{n})" for t, n in degraded)
+        self.audit.append(kind="safety.degrade", target=targets,
+                          detail=f"连续失败达阈值，降级为只告警并进入 maintenance",
+                          trigger=trigger, suppressed=True, reason="fail_streak")
+        current = self.state.get("profile") or self.config.profile
+        if current != "maintenance":
+            await self.apply_profile(
+                "maintenance",
+                reason=f"目标 {targets} 连续失败达阈值，自动降级等待人工")
+        await self.notifier.push(
+            f"[安全降级] 目标 {targets} 连续失败达到阈值，已自动切换为"
+            "「维护档位」：暂停全部自动动作、静默告警，等待人工介入。",
+            severity=Severity.FATAL, force=True, target="safety", status="degrade")
 
     # ================================================================== #
     # 生命周期
@@ -307,12 +338,27 @@ class HealthEngine:
                             bypass_confirm: bool = False) -> tuple[bool, str]:
         """执行一次真睡眠。返回 (ok, detail)。
 
+        二次确认（B12 §L-D / B09 §6.2）：`bypass_confirm=False` 时**拒绝执行**并返回
+        确认提示。真睡眠会停机再启动目标容器（服务中断若干秒），属于破坏性动作；
+        引擎作为权威执行者，不能假定调用方一定做过确认——否则一旦适配层漏了闸门，
+        这里就成了无确认直通路径。只有权威来源才显式传 `bypass_confirm=True`：
+        生命周期 force_sleep、定时任务、管理员命令、以及已完成二次确认的 LLM 请求。
+
         目标裁剪规则（纵深防御 + 优雅降级）：
         - 不在动作白名单内的目标：剔除
         - 受保护且未开启 allow_self_restart 的目标：剔除（通常是 astrbot 本体）
         - 若裁剪后为空：返回明确错误，并提示如何开启本体睡眠
         """
         cfg = self.config
+        if not bypass_confirm:
+            targets_txt = ", ".join(cfg.lifecycle.sleep_targets or []) or "(未配置)"
+            msg = (f"需要二次确认：这是一次真睡眠（将重启 {targets_txt}，"
+                   "服务会短暂中断）。请确认后以 confirm=true 重试。")
+            self.audit.append(kind="sleep.confirm_required", target=targets_txt,
+                              detail=msg, actor=actor, trigger=trigger,
+                              suppressed=True, reason="confirm_required")
+            return False, msg
+
         allow = cfg.action_allowlist
         raw_targets = list(cfg.lifecycle.sleep_targets or [])
         targets: list[str] = []
@@ -355,7 +401,8 @@ class HealthEngine:
         action = action_cls(self.config, self.deps)
         result = await action.execute(spec)
         if not spec.params.get("_watchdog_committed"):
-            self.safety.commit(spec, result.ok)
+            degraded = self.safety.commit(spec, result.ok)
+            await self._note_degradation(degraded, trigger)
         self.state.set("lifecycle.state", self.lifecycle_state.to_dict())
         self.audit.append(kind="sleep.execute", target=",".join(targets),
                           detail=result.detail, actor=actor, trigger=trigger,

@@ -110,8 +110,14 @@ async def run_check(rt, scope: str = "all") -> str:
 
 
 async def request_sleep(rt, reason: str, duration_min: float = 0,
-                        is_admin: bool = False, armed: bool = False) -> str:
-    """请求一次真睡眠（重启目标容器）。由 Bot 自主决定调用。"""
+                        is_admin: bool = False, armed: bool = False,
+                        confirm: bool = False) -> str:
+    """请求一次真睡眠（重启目标容器）。由 Bot 自主决定调用。
+
+    破坏性二次确认（B12 §L-D / B09 §6.2）：真睡眠会中断服务，因此除"已武装"的
+    权威路径外，首次调用（`confirm=false`）只回确认提示、**不执行**；必须再次调用
+    并置 `confirm=true` 才进入安全链。
+    """
     dur = safe_int(duration_min, 0, low=0, high=120)
     reason = (reason or "Bot 自主请求休息").strip()[:200]
 
@@ -124,14 +130,20 @@ async def request_sleep(rt, reason: str, duration_min: float = 0,
         return f"（dry-run 模式）睡眠未真正执行：{detail}"
 
     if not armed:
-        # 未到 arm_sleep 等级时，需管理员确认；此处由工具层直接执行但记录来源
+        # 未到 arm_sleep 等级时，需管理员权限；此处由工具层直接执行但记录来源
         allowed, msg = check_admin(rt, is_admin)
         if not allowed:
             return (msg + " 若确实需要，可等待生命周期等级推进到"
                     "「准备睡眠」或由管理员执行 /guardian sleep。")
 
+    # 二次确认：只有"已武装"（生命周期权威路径）或显式 confirm=true 才真正执行。
+    if not (armed or confirm):
+        return ("确认执行？将执行一次真睡眠（重启睡眠目标容器，服务会短暂中断后恢复）。\n"
+                "请再次调用并置 confirm=true；当前 dry_run="
+                f"{'开' if rt.config.dry_run else '关'}。")
+
     ok, detail = await rt.request_sleep(reason, dur, actor="llm",
-                                        trigger="llm", bypass_confirm=armed)
+                                        trigger="llm", bypass_confirm=True)
     if ok:
         return (f"已开始睡眠：{detail}。我会休息一下，"
                 "期间服务会短暂中断，醒来后继续。")
@@ -139,7 +151,12 @@ async def request_sleep(rt, reason: str, duration_min: float = 0,
 
 
 async def restart_container(rt, container: str, reason: str = "",
-                            is_admin: bool = False) -> str:
+                            is_admin: bool = False, confirm: bool = False) -> str:
+    """重启受管容器。破坏性操作，需管理员 + 白名单 + 二次确认（B09 §6.2 / B12 §L-D）。
+
+    首次调用（`confirm=false`）只返回确认提示、不执行；`confirm=true` 才进入
+    `SafetyGuard` 白名单/冷却/熔断/dry-run 安全链。
+    """
     allowed, msg = check_admin(rt, is_admin)
     if not allowed:
         return msg
@@ -148,6 +165,10 @@ async def restart_container(rt, container: str, reason: str = "",
     if name not in allow:
         return (f"容器 {name or '(空)'} 不在动作白名单内，已拒绝。"
                 f"允许的目标：{', '.join(allow) or '(白名单为空)'}")
+    if not confirm:
+        return (f"确认执行？将重启容器 {name}。\n"
+                "请再次调用并置 confirm=true；当前 dry_run="
+                f"{'开' if rt.config.dry_run else '关'}。")
     ok, detail = await rt.request_restart(
         name, actor="llm", trigger="llm", reason=reason or "Bot 请求重启")
     if ok:

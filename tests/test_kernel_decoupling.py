@@ -36,6 +36,10 @@ PLUGIN = Path(SRC) / "astrbot_plugin_guardian"
 #: 内核侧包：这些包必须能在没有 astrbot 的进程里导入。
 KERNEL_PACKAGES = ("core", "probes", "utils", "actions", "notify", "modes", "tools")
 
+#: 内核侧**顶层**模块（不属于上面的包，但同样必须能脱离 astrbot 导入）。
+#: M1 之后内核装配被拆到 kernel_runtime.py，它必须保持零 astrbot 依赖。
+KERNEL_TOP_LEVEL_MODULES = ("kernel_runtime.py",)
+
 #: 唯一允许提及 astrbot 的内核侧文件（日志门面，内部 try/except 转发）。
 ALLOWED_ASTRBOT_REFERENCES = {"core/log.py"}
 
@@ -50,6 +54,10 @@ def _kernel_source_files():
             continue
         for path in sorted(directory.rglob("*.py")):
             yield path, str(path.relative_to(PLUGIN)).replace("\\", "/")
+    for name in KERNEL_TOP_LEVEL_MODULES:
+        path = PLUGIN / name
+        if path.is_file():
+            yield path, name
 
 
 def test_no_kernel_module_imports_astrbot():
@@ -69,8 +77,12 @@ def test_no_kernel_module_imports_astrbot():
 
 
 def test_only_the_adapter_touches_astrbot():
-    """把"允许提及 astrbot"的范围钉死，防止后续悄悄扩大耦合面。"""
-    allowed = {"main.py", "runtime.py", "core/log.py", "__init__.py"}
+    """把"允许提及 astrbot"的范围钉死，防止后续悄悄扩大耦合面。
+
+    自 M1 起 `runtime.py` 只是兼容壳、不再直接 import astrbot，故已从白名单移除；
+    真正接触 AstrBot 的只剩 `main.py`（插件入口）与 `adapter_runtime.py`（域 B）。
+    """
+    allowed = {"main.py", "adapter_runtime.py", "core/log.py", "__init__.py"}
     offenders: list[str] = []
     for path in sorted(PLUGIN.rglob("*.py")):
         relative = str(path.relative_to(PLUGIN)).replace("\\", "/")
@@ -82,7 +94,7 @@ def test_only_the_adapter_touches_astrbot():
                     or stripped.startswith("import astrbot")):
                 offenders.append(f"{relative}:{number}: {stripped}")
     assert not offenders, (
-        "除 AstrBot 适配层（main.py / runtime.py）与日志门面（core/log.py）外，"
+        "除 AstrBot 适配层（main.py / adapter_runtime.py）与日志门面（core/log.py）外，"
         "不得出现 astrbot 导入：\n  " + "\n  ".join(offenders)
     )
 
@@ -110,6 +122,9 @@ def _kernel_module_names() -> list[str]:
             if parts[-1] == "__init__":
                 parts.pop()
             names.append("astrbot_plugin_guardian." + ".".join(parts))
+    for name in KERNEL_TOP_LEVEL_MODULES:
+        if (PLUGIN / name).is_file():
+            names.append("astrbot_plugin_guardian." + name[:-3])
     return names
 
 
@@ -145,6 +160,93 @@ def test_kernel_packages_import_without_astrbot():
             if name == "astrbot" or name.startswith(("astrbot.", "astrbot_plugin_guardian")):
                 sys.modules.pop(name, None)
         sys.modules.update(saved_modules)
+
+
+# --------------------------------------------------------------------------- #
+# 3. M1 验收（B16 §9）：内核能在**没有 astrbot 的解释器**里构造并跑完一轮 patrol
+# --------------------------------------------------------------------------- #
+def test_kernel_constructs_and_runs_patrol_without_astrbot():
+    """这是 M1 的验收判据：内核（域 A）不依赖 AstrBot 也能装配并巡检。
+
+    做法：阻断 astrbot 导入，构造 `GuardianKernel`（注入假 docker / 假通知发送器），
+    然后真正跑一轮 `run_once`，要求不抛异常、且探针确实产出了结果。
+    """
+    import asyncio
+    import tempfile
+
+    saved_modules = {k: v for k, v in sys.modules.items()
+                     if k == "astrbot" or k.startswith(("astrbot.", "astrbot_plugin_guardian"))}
+    blocker = _AstrbotBlocker()
+    for name in list(saved_modules):
+        sys.modules.pop(name, None)
+    sys.meta_path.insert(0, blocker)
+    try:
+        kernel_mod = importlib.import_module("astrbot_plugin_guardian.kernel_runtime")
+        assert kernel_mod.__dict__.get("logger") is not None
+
+        class FakeDocker:
+            """只读替身：docker daemon 正常、两个容器 running、内存稳定。"""
+
+            async def negotiate(self):
+                return "v1.44"
+
+            async def ping(self):
+                return True
+
+            async def info(self):
+                return {"Containers": 2, "ContainersRunning": 2}
+
+            async def inspect(self, name):
+                return {"State": {"Running": True, "RestartCount": 0, "OOMKilled": False,
+                                  "StartedAt": "2026-10-14T10:00:00.000000000Z",
+                                  "Status": "running"}}
+
+            async def stats(self, name):
+                return {"usage": 300 * 1024 * 1024, "limit": 4 * 1024 ** 3,
+                        "stats": {"inactive_file": 10 * 1024 * 1024}}
+
+            async def close(self):
+                return None
+
+        sent: list[tuple[str, str]] = []
+
+        async def sender(umo, text):
+            sent.append((umo, text))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            kernel = kernel_mod.GuardianKernel(
+                {"containers": {"managed": ["astrbot", "napcat"]},
+                 "dry_run": True,
+                 "notify": {"umo_list": []}},
+                data_dir=tmp, sender=sender)
+            kernel.deps["docker"] = FakeDocker()
+            kernel.engine.deps["docker"] = kernel.deps["docker"]
+
+            asyncio.run(kernel.engine.start())
+            result = asyncio.run(kernel.run_check("all"))
+
+            assert result.get("skipped") is False, result
+            assert result["results"], "内核在无 astrbot 环境下没有跑出任何探针结果"
+            assert any(r["probe"] == "uptime" for r in result["results"]), \
+                [r["probe"] for r in result["results"]]
+            # 内核数据目录必须落在自己指定的位置
+            assert (Path(tmp) / "guardian" / "state.json").exists(), \
+                list(Path(tmp).rglob("*"))
+    finally:
+        sys.meta_path.remove(blocker)
+        for name in list(sys.modules):
+            if name == "astrbot" or name.startswith(("astrbot.", "astrbot_plugin_guardian")):
+                sys.modules.pop(name, None)
+        sys.modules.update(saved_modules)
+
+
+def test_runtime_shell_stays_astrbot_free():
+    """兼容壳 runtime.py 不得自己 import astrbot（只转发 adapter_runtime）。"""
+    source = (PLUGIN / "runtime.py").read_text(encoding="utf-8")
+    for number, line in enumerate(source.splitlines(), 1):
+        stripped = line.strip()
+        assert not (stripped.startswith("from astrbot")
+                    or stripped.startswith("import astrbot")), f"runtime.py:{number}"
 
 
 # --------------------------------------------------------------------------- #

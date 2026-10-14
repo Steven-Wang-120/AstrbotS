@@ -291,20 +291,28 @@ class SafetyGuard:
         return Decision(True, False, "通过", "ok")
 
     # ------------------------------------------------------------------ #
-    def commit(self, action: ActionSpec, ok: bool) -> None:
+    def commit(self, action: ActionSpec, ok: bool) -> list[tuple[str, int]]:
         """动作执行后登记：冷却时间戳、动作计数、失败连击。
 
         注意：dry-run 不产生真实副作用，因此**不消耗**冷却与配额，
         否则空跑会把后续真实动作全部挡掉。
+
+        返回值：本轮**首次**跨过连续失败阈值的目标列表 ``[(target, streak), ...]``。
+        调用方（引擎）据此执行 B00 §10.6 的"降级为只告警 + 进入 maintenance 档位"。
+        之所以不在这里直接改档位：safety 层只做授权与记账，不持有调度/档位状态；
+        由引擎统一处理可避免同一失败在多条路径（巡检 / 睡眠 / 看门狗对账）里
+        被重复降级、重复通知。
         """
         if action.dry_run:
-            return
+            return []
         if action.kind == "sleep":
             targets = list(action.params.get("targets", [action.target]))
         else:
             # 逻辑目标动作按物理容器记账（qq_relogin -> napcat）：否则冷却与失败连击
             # 会记在 "qq" 上，与容器级动作互相看不见，形成绕过通道。
             targets = self._physical_targets(action) or [action.target]
+        threshold = int(self.config.safety.max_consecutive_failures or 3)
+        degraded: list[tuple[str, int]] = []
         self.state.record_action()  # One authorized group request consumes one action quota.
         for target in targets:
             self.state.bump_cooldown(target)
@@ -312,5 +320,9 @@ class SafetyGuard:
                 self.state.reset_fail_streak(target)
             else:
                 streak = self.state.bump_fail_streak(target)
-                if streak >= int(self.config.safety.max_consecutive_failures or 3):
-                    logger.warning(f"[guardian] 目标 {target} 连续失败 {streak} 次，自动降级为只告警")
+                # 只在"恰好跨过阈值"的那一刻上报一次，避免持续失败时反复触发降级/通知。
+                if streak == threshold:
+                    logger.warning(
+                        f"[guardian] 目标 {target} 连续失败 {streak} 次，自动降级为只告警")
+                    degraded.append((target, streak))
+        return degraded
