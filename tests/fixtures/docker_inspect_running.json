@@ -1,0 +1,20 @@
+{
+  "Id": "abc123",
+  "Name": "/napcat",
+  "State": {
+    "Status": "running",
+    "Running": true,
+    "Paused": false,
+    "Restarting": false,
+    "OOMKilled": false,
+    "Dead": false,
+    "Pid": 1234,
+    "ExitCode": 0,
+    "StartedAt": "2026-10-13T04:00:00.123456789Z",
+    "FinishedAt": "0001-01-01T00:00:00Z",
+    "RestartCount": 2,
+    "Health": { "Status": "healthy", "FailingStreak": 0 }
+  },
+  "RestartCount": 2,
+  "HostConfig": { "RestartPolicy": { "Name": "unless-stopped", "MaximumRetryCount": 0 } }
+}

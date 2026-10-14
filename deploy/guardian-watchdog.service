@@ -1,0 +1,16 @@
+# Host watchdog: one tick per invocation, including saved wake deadlines.
+# Install guardian-watchdog.sh and guardian-watchdog.py together in /usr/local/bin.
+[Unit]
+Description=Guardian Host Watchdog (Docker restart and timed sleep)
+Documentation=file:/usr/local/bin/guardian-watchdog.py
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=40min
+Environment=GUARDIAN_COMPOSE_DIR=/opt/astrbot-stack
+Environment="GUARDIAN_ALLOWED_TARGETS=astrbot napcat"
+Environment=GUARDIAN_MAX_AGE_SEC=120
+ExecStart=/usr/local/bin/guardian-watchdog.sh
+Nice=5

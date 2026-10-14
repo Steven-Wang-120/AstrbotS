@@ -1,0 +1,190 @@
+"""Guardian 守护系统 —— Docker Engine HTTP 客户端（unix socket）。
+
+对应文档：B04 §3
+
+设计：优先走 `/var/run/docker.sock` 的 Engine HTTP API（容器内无需 docker CLI），
+可选降级到 CLI。所有调用带超时，异常统一为 DockerUnavailable / DockerError。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from typing import Any
+
+import aiohttp
+from astrbot.api import logger
+
+
+class DockerUnavailable(RuntimeError):
+    """daemon/socket 不可达。"""
+
+
+class DockerError(RuntimeError):
+    """Docker API 返回错误或操作失败。"""
+
+    def __init__(self, message: str, status: int = 0) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _demux(data: bytes) -> str:
+    """解析 Docker exec 的多路复用流（8 字节帧头）。"""
+    out: list[str] = []
+    i = 0
+    while i + 8 <= len(data):
+        size = int.from_bytes(data[i + 4:i + 8], "big")
+        payload = data[i + 8:i + 8 + size]
+        out.append(payload.decode("utf-8", "replace"))
+        i += 8 + size
+    if not out:
+        return data.decode("utf-8", "replace")
+    return "".join(out)
+
+
+class DockerClient:
+    def __init__(self, socket_path: str = "/var/run/docker.sock",
+                 api_version: str = "v1.44", timeout: float = 10.0,
+                 use_cli_fallback: bool = False, cli_path: str = "docker") -> None:
+        self.socket_path = socket_path
+        self.api_version = api_version or "v1.44"
+        self.timeout = float(timeout)
+        self.use_cli_fallback = bool(use_cli_fallback)
+        self.cli_path = cli_path
+        self._session: aiohttp.ClientSession | None = None
+        self._negociated = False
+
+    # ------------------------------------------------------------------ #
+    async def _ensure_session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            connector = aiohttp.UnixConnector(path=self.socket_path)
+            self._session = aiohttp.ClientSession(
+                connector=connector,
+                timeout=aiohttp.ClientTimeout(total=self.timeout),
+            )
+        return self._session
+
+    async def _request(self, method: str, path: str, *,
+                       params: dict | None = None,
+                       payload: Any = None,
+                       raw: bool = False) -> Any:
+        session = await self._ensure_session()
+        url = f"http://localhost/{self.api_version}{path}"
+        try:
+            async with session.request(method, url, params=params, json=payload) as resp:
+                body = await resp.read()
+                if resp.status >= 400:
+                    text = body.decode("utf-8", "replace")[:400]
+                    raise DockerError(
+                        f"Docker API {method} {path} -> {resp.status}: {text}",
+                        resp.status)
+                if raw:
+                    return body
+                if not body:
+                    return {}
+                try:
+                    return json.loads(body.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return {"_raw": body.decode("utf-8", "replace")}
+        except aiohttp.ClientError as exc:
+            raise DockerUnavailable(f"Docker 不可达({self.socket_path}): {exc}") from exc
+        except asyncio.TimeoutError as exc:
+            raise DockerUnavailable(f"Docker 请求超时: {method} {path}") from exc
+
+    # ------------------------------------------------------------------ #
+    async def ping(self) -> bool:
+        try:
+            await self._request("GET", "/_ping")
+            return True
+        except (DockerUnavailable, DockerError):
+            return False
+
+    async def version(self) -> dict[str, Any]:
+        return await self._request("GET", "/version")
+
+    async def negotiate(self) -> str:
+        """协商 API 版本：优先配置值，失败则回退到 /version 报告的版本。"""
+        if self._negociated:
+            return self.api_version
+        try:
+            info = await self._request("GET", "/version")
+            api = str(info.get("ApiVersion") or "").strip()
+            if api:
+                self.api_version = api if api.startswith("v") else f"v{api}"
+        except (DockerUnavailable, DockerError) as exc:
+            logger.debug(f"[guardian] Docker 版本协商失败，沿用 {self.api_version}: {exc}")
+        self._negociated = True
+        return self.api_version
+
+    async def info(self) -> dict[str, Any]:
+        return await self._request("GET", "/info")
+
+    async def list_containers(self, all_: bool = True) -> list[dict[str, Any]]:
+        data = await self._request("GET", "/containers/json", params={"all": "1" if all_ else "0"})
+        return data if isinstance(data, list) else []
+
+    async def exists(self, name: str) -> bool:
+        try:
+            await self.inspect(name)
+            return True
+        except DockerError as exc:
+            if exc.status == 404:
+                return False
+            raise
+        except DockerUnavailable:
+            raise
+
+    async def inspect(self, name: str) -> dict[str, Any]:
+        return await self._request("GET", f"/containers/{name}/json")
+
+    async def restart(self, name: str, timeout: int = 10) -> None:
+        await self._request("POST", f"/containers/{name}/restart",
+                            params={"t": str(int(timeout))})
+
+    async def start(self, name: str) -> None:
+        await self._request("POST", f"/containers/{name}/start")
+
+    async def stop(self, name: str, timeout: int = 10) -> None:
+        await self._request("POST", f"/containers/{name}/stop",
+                            params={"t": str(int(timeout))})
+
+    async def stats(self, name: str) -> dict[str, Any]:
+        return await self._request("GET", f"/containers/{name}/stats",
+                                   params={"stream": "false"})
+
+    # ---- exec ---- #
+    async def exec_run(self, name: str, cmd: list[str],
+                       timeout: float | None = None) -> tuple[int, str]:
+        """在容器内执行命令，返回 (exit_code, 合并输出)。cmd 为 argv 列表。"""
+        created = await self._request(
+            "POST", f"/containers/{name}/exec",
+            payload={
+                "AttachStdout": True,
+                "AttachStderr": True,
+                "Tty": False,
+                "Cmd": list(cmd),
+            })
+        exec_id = created.get("Id")
+        if not exec_id:
+            raise DockerError("exec 创建失败：未返回 Id")
+        session = await self._ensure_session()
+        url = f"http://localhost/{self.api_version}/exec/{exec_id}/start"
+        try:
+            async with session.post(
+                url, json={"Detach": False, "Tty": False},
+                timeout=aiohttp.ClientTimeout(total=timeout or self.timeout),
+            ) as resp:
+                body = await resp.read()
+                if resp.status >= 400:
+                    raise DockerError(f"exec start -> {resp.status}", resp.status)
+        except aiohttp.ClientError as exc:
+            raise DockerUnavailable(f"exec 不可达: {exc}") from exc
+        text = _demux(body)
+        info = await self._request("GET", f"/exec/{exec_id}/json")
+        return int(info.get("ExitCode") or 0), text
+
+    # ------------------------------------------------------------------ #
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None

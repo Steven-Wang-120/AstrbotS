@@ -1,0 +1,21 @@
+name: astrbot_plugin_guardian
+display_name: 守护系统 Guardian
+short_desc: 服务器/ROS2 双模式健康守护：容器自愈、QQ 重登、内存泄漏防护、生命周期自主睡眠
+desc: >-
+  守护系统（Guardian）为 AstrBot 提供双模式健康守护能力。服务器模式下默认面向
+  Arch Linux + Docker 双容器（napcat / astrbot）部署，负责容器健康与自动重启、
+  QQ 掉线检测与重登、内存泄漏监控与防护、定时维护重启；ROS2 模式下守护节点与话题。
+  内置生命周期等级机制：按容器运行时长分级并向 Bot 注入不同提示词，使 Bot 自主决定
+  在 30 天内真正"睡眠"（重启维护）至少一次。全部能力以 LLM 工具形式暴露给 Bot 自主调用，
+  并由白名单、冷却、熔断、dry-run 四重安全约束保护。
+author: AstrbotS
+version: 0.2.0
+repo: "https://github.com/Steven-Wang-120/AstrbotS"
+astrbot_version: ">=4.5.7"
+support_platforms:
+  - aiocqhttp
+  - qq_official
+  - telegram
+  - lark
+  - dingtalk
+  - discord

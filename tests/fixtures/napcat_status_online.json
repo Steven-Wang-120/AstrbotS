@@ -1,0 +1,9 @@
+{
+  "status": "ok",
+  "retcode": 0,
+  "data": {
+    "online": true,
+    "good": true,
+    "stat": { "packet_received": 100, "packet_sent": 90 }
+  }
+}

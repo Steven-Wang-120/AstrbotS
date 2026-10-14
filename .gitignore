@@ -1,0 +1,32 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ---- 运行时状态与审计日志（不入库）----
+src/data/guardian/
+tests/_tmp/
+
+# ---- 环境变量（仅保留 .env.example）----
+.env
+.env.*
+!.env.example
+deploy/.env
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ---- 日志与临时文件 ----
+*.log

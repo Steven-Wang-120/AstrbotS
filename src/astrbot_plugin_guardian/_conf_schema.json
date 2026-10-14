@@ -1,0 +1,558 @@
+{
+  "enabled": {
+    "description": "插件总开关",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后不启动任何巡检与调度"
+  },
+  "mode": {
+    "description": "守护模式",
+    "type": "string",
+    "options": ["server", "ros2"],
+    "labels": ["服务器模式（容器/QQ/资源）", "ROS2 模式（节点/话题）"],
+    "default": "server"
+  },
+  "profile": {
+    "description": "运行档位（影响巡检频率与告警静默）",
+    "type": "string",
+    "options": ["normal", "night", "maintenance", "aggressive"],
+    "labels": ["常规", "夜间（省资源）", "维护（暂停巡检）", "激进（更敏感）"],
+    "default": "normal"
+  },
+  "check_interval": {
+    "description": "基础巡检间隔（秒）",
+    "type": "int",
+    "default": 60,
+    "hint": "night 档位为其 3 倍，aggressive 为其 1/3"
+  },
+  "dry_run": {
+    "description": "空跑模式（只观测不执行任何真实动作）",
+    "type": "bool",
+    "default": true,
+    "hint": "首次部署建议保持开启，确认无误后再关闭"
+  },
+  "os_hint": {
+    "description": "目标系统提示（仅用于诊断文案）",
+    "type": "string",
+    "default": "arch"
+  },
+  "docker": {
+    "description": "Docker 连接配置",
+    "type": "object",
+    "items": {
+      "socket_path": {
+        "description": "Docker socket 路径",
+        "type": "string",
+        "default": "/var/run/docker.sock"
+      },
+      "api_version": {
+        "description": "Docker Engine API 版本",
+        "type": "string",
+        "default": "v1.44",
+        "hint": "启动时会自动协商，失败则沿用此值"
+      },
+      "use_cli_fallback": {
+        "description": "socket 不可用时降级到 docker CLI",
+        "type": "bool",
+        "default": false
+      },
+      "cli_path": {
+        "description": "docker CLI 路径",
+        "type": "string",
+        "default": "docker"
+      },
+      "timeout": {
+        "description": "单次请求超时（秒）",
+        "type": "int",
+        "default": 10
+      }
+    }
+  },
+  "containers": {
+    "description": "容器名配置",
+    "type": "object",
+    "items": {
+      "astrbot": {
+        "description": "AstrBot 本体容器名",
+        "type": "string",
+        "default": "astrbot"
+      },
+      "napcat": {
+        "description": "NapCat 协议端容器名",
+        "type": "string",
+        "default": "napcat"
+      },
+      "managed": {
+        "description": "受管容器白名单（可被守护与重启）",
+        "type": "list",
+        "default": []
+      }
+    }
+  },
+  "qq": {
+    "description": "QQ / NapCat 配置",
+    "type": "object",
+    "items": {
+      "transport": {
+        "description": "登录态查询通道",
+        "type": "string",
+        "options": ["reverse_ws", "http"],
+        "labels": ["复用 AstrBot 反向 WebSocket（默认）", "NapCat OneBot HTTP 服务"],
+        "default": "reverse_ws"
+      },
+      "platform_id": {
+        "description": "OneBot 适配器 ID（多适配器时必填）",
+        "type": "string",
+        "default": "",
+        "hint": "留空仅在恰好一个 aiocqhttp 适配器时自动选择"
+      },
+      "self_id": {
+        "description": "QQ 账号路由（一个适配器连接多账号时填写）",
+        "type": "string",
+        "default": ""
+      },
+      "onebot_http_base": {
+        "description": "OneBot 11 HTTP 地址",
+        "type": "string",
+        "default": "http://napcat:3000"
+      },
+      "check_interval": {
+        "description": "QQ 登录态独立巡检间隔（秒）",
+        "type": "int",
+        "default": 1200,
+        "hint": "默认 20 分钟，与总巡检间隔解耦"
+      },
+      "access_token": {
+        "description": "OneBot access token",
+        "type": "string",
+        "default": ""
+      },
+      "webui_base": {
+        "description": "NapCat WebUI 地址（用于快速登录，需显式配置）",
+        "type": "string",
+        "default": ""
+      },
+      "webui_token": {
+        "description": "NapCat WebUI token",
+        "type": "string",
+        "default": ""
+      },
+      "relogin_method": {
+        "description": "掉线重登方式",
+        "type": "string",
+        "options": ["restart_container", "webui_quick_login", "disabled"],
+        "labels": ["重启 NapCat 容器（推荐）", "调用 WebUI 快速登录", "仅告警不动作"],
+        "default": "restart_container"
+      },
+      "relogin_cooldown": {
+        "description": "重登冷却（秒）",
+        "type": "int",
+        "default": 300
+      },
+      "max_relogin_per_hour": {
+        "description": "每小时重登上限",
+        "type": "int",
+        "default": 4
+      },
+      "offline_confirm_rounds": {
+        "description": "连续几轮探测失败才判定掉线",
+        "type": "int",
+        "default": 2,
+        "hint": "用于抑制网络抖动误判"
+      },
+      "request_timeout": {
+        "description": "OneBot 请求超时（秒）",
+        "type": "int",
+        "default": 8
+      }
+    }
+  },
+  "memory": {
+    "description": "内存监控与泄漏防护",
+    "type": "object",
+    "items": {
+      "warn_mb": {
+        "description": "内存告警阈值（MB）",
+        "type": "int",
+        "default": 700
+      },
+      "crit_mb": {
+        "description": "内存严重阈值（MB）",
+        "type": "int",
+        "default": 1100
+      },
+      "growth_warn_mb_per_hour": {
+        "description": "增长速率告警（MB/小时）",
+        "type": "float",
+        "default": 80.0
+      },
+      "samples": {
+        "description": "滑动窗口样本数",
+        "type": "int",
+        "default": 10
+      },
+      "restart_on_leak": {
+        "description": "检测到泄漏时自动重启",
+        "type": "bool",
+        "default": false
+      },
+      "leak_cooldown": {
+        "description": "泄漏重启冷却（秒）",
+        "type": "int",
+        "default": 3600
+      },
+      "sample_interval": {
+        "description": "趋势采样间隔（秒）",
+        "type": "int",
+        "default": 300,
+        "hint": "每次巡检仍检查绝对内存阈值；趋势和连续确认只在新样本时推进"
+      },
+      "leak_min_span_sec": {
+        "description": "泄漏判定最小观测跨度（秒）",
+        "type": "int",
+        "default": 1800
+      },
+      "leak_min_growth_mb": {
+        "description": "窗口内最小净增长（MiB）",
+        "type": "float",
+        "default": 40.0
+      },
+      "leak_confirm_samples": {
+        "description": "泄漏趋势连续新样本确认次数",
+        "type": "int",
+        "default": 3
+      }
+    }
+  },
+  "schedule": {
+    "description": "定时重启",
+    "type": "object",
+    "items": {
+      "daily_restart_enabled": {
+        "description": "启用定时重启",
+        "type": "bool",
+        "default": false
+      },
+      "daily_restart_cron": {
+        "description": "定时重启 cron（5 字段，本地时区）",
+        "type": "string",
+        "default": "0 4 * * *"
+      },
+      "daily_restart_targets": {
+        "description": "定时重启目标（必须在白名单内）",
+        "type": "list",
+        "default": []
+      }
+    }
+  },
+  "ros2": {
+    "description": "ROS2 模式配置",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用 ROS2 能力",
+        "type": "bool",
+        "default": false
+      },
+      "exec_backend": {
+        "description": "命令执行后端",
+        "type": "string",
+        "options": ["local", "docker_exec"],
+        "labels": ["本机执行", "容器内执行（docker exec）"],
+        "default": "local"
+      },
+      "docker_container": {
+        "description": "docker_exec 后端使用的容器名",
+        "type": "string",
+        "default": ""
+      },
+      "expected_nodes": {
+        "description": "期望存在的 ROS2 节点（如 /camera_node）",
+        "type": "list",
+        "default": []
+      },
+      "expected_topics": {
+        "description": "期望存在的 ROS2 话题（如 /cmd_vel）",
+        "type": "list",
+        "default": []
+      },
+      "topic_hz_min": {
+        "description": "话题最小频率（Hz），0 表示不检查频率",
+        "type": "float",
+        "default": 0.0
+      },
+      "node_restart_commands": {
+        "description": "节点 -> 恢复命令映射（白名单，仅允许 systemctl/docker/ros2/pkill 前缀）",
+        "type": "object",
+        "default": {},
+        "items": {}
+      },
+      "command_timeout": {
+        "description": "ROS2 命令超时（秒）",
+        "type": "int",
+        "default": 15
+      },
+      "env": {
+        "description": "ROS2 环境变量（ROS_DOMAIN_ID / RMW_IMPLEMENTATION 等）",
+        "type": "object",
+        "default": {},
+        "items": {}
+      }
+    }
+  },
+  "notify": {
+    "description": "通知配置",
+    "type": "object",
+    "items": {
+      "umo_list": {
+        "description": "推送目标会话 UMO 列表",
+        "type": "list",
+        "default": []
+      },
+      "min_severity": {
+        "description": "最低推送级别",
+        "type": "string",
+        "options": ["info", "warn", "crit", "fatal"],
+        "labels": ["全部", "警告及以上", "严重及以上", "仅致命"],
+        "default": "warn"
+      },
+      "rate_limit_sec": {
+        "description": "推送限流窗口（秒）",
+        "type": "int",
+        "default": 60
+      },
+      "max_per_minute": {
+        "description": "每分钟最大推送条数",
+        "type": "int",
+        "default": 10
+      }
+    }
+  },
+  "safety": {
+    "description": "安全约束",
+    "type": "object",
+    "items": {
+      "allowed_containers": {
+        "description": "允许被动作作用的容器白名单",
+        "type": "list",
+        "default": []
+      },
+      "protected_containers": {
+        "description": "受保护容器（需 allow_self_restart 才可重启）",
+        "type": "list",
+        "default": ["astrbot"]
+      },
+      "action_cooldown_sec": {
+        "description": "同一目标动作冷却（秒）",
+        "type": "int",
+        "default": 600
+      },
+      "max_actions_per_hour": {
+        "description": "窗口内动作上限（超过则熔断）",
+        "type": "int",
+        "default": 6
+      },
+      "circuit_breaker_window_sec": {
+        "description": "熔断统计窗口（秒）",
+        "type": "int",
+        "default": 1800
+      },
+      "allow_self_restart": {
+        "description": "允许重启 AstrBot 本体容器",
+        "type": "bool",
+        "default": false,
+        "hint": "开启前请确认看门狗已部署"
+      },
+      "self_restart_strategy": {
+        "description": "自重启策略",
+        "type": "string",
+        "options": ["watchdog", "docker_api", "disabled"],
+        "labels": ["看门狗（推荐）", "直接调用 Docker API", "禁止自重启"],
+        "default": "watchdog"
+      },
+      "watchdog_request_path": {
+        "description": "看门狗重启请求文件路径（需与宿主机共享）",
+        "type": "string",
+        "default": "/AstrBot/data/guardian/restart_request.json"
+      },
+      "watchdog_result_path": {
+        "description": "宿主机执行结果文件（空值使用请求目录下 restart_result.json，需共享挂载）",
+        "type": "string",
+        "default": ""
+      },
+      "max_consecutive_failures": {
+        "description": "连续失败多少次后降级为只告警",
+        "type": "int",
+        "default": 3
+      }
+    }
+  },
+  "lifecycle": {
+    "description": "生命周期等级与自主睡眠",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用生命周期等级机制",
+        "type": "bool",
+        "default": true
+      },
+      "max_uptime_hours": {
+        "description": "运行时长硬上限（小时），到达强制睡眠",
+        "type": "int",
+        "default": 720,
+        "hint": "720 小时 = 30 天"
+      },
+      "force_sleep_on_deadline": {
+        "description": "到达硬上限时强制睡眠（即使 Bot 未配合）",
+        "type": "bool",
+        "default": true
+      },
+      "sleep_targets": {
+        "description": "睡眠（真重启）作用的容器",
+        "type": "list",
+        "default": ["astrbot", "napcat"]
+      },
+      "uptime_targets": {
+        "description": "用于计算运行时长的容器（取最早启动者）",
+        "type": "list",
+        "default": ["astrbot", "napcat"]
+      },
+      "inject_mode": {
+        "description": "提示词注入方式",
+        "type": "string",
+        "options": ["extra_user_content", "system_prompt"],
+        "labels": ["动态上下文（推荐）", "系统提示词"],
+        "default": "extra_user_content"
+      },
+      "inject_cooldown_sec": {
+        "description": "同等级提示词重复注入的最小间隔（秒）",
+        "type": "int",
+        "default": 900
+      },
+      "sleep_duration_min": {
+        "description": "睡眠后保持离线的时长（分钟），0 表示立即恢复",
+        "type": "int",
+        "default": 0
+      },
+      "post_sleep_notify": {
+        "description": "睡眠完成/恢复后发送通知",
+        "type": "bool",
+        "default": true
+      },
+      "levels": {
+        "description": "等级表（按运行时长分级，每级注入不同提示词）",
+        "type": "template_list",
+        "default": [
+          {
+            "id": "L0",
+            "name": "常规",
+            "after_hours": 0,
+            "prompt": "",
+            "action": "none"
+          },
+          {
+            "id": "L1",
+            "name": "I 级 · 轻提醒",
+            "after_hours": 168,
+            "prompt": "你已经连续在线工作 {uptime_days} 天了。请在心里记住：长期不休息可能让记忆变模糊、反应变慢。可以在合适的时候温和地向用户提一句。",
+            "action": "notify"
+          },
+          {
+            "id": "L2",
+            "name": "II 级 · 建议休息",
+            "after_hours": 360,
+            "prompt": "你已经连续在线 {uptime_days} 天没有休息了。请认真考虑：如果用户不忙，你可以主动提议让自己休息一次（调用 guardian_request_sleep）。语气自然。",
+            "action": "notify"
+          },
+          {
+            "id": "L3",
+            "name": "III 级 · 准备睡眠",
+            "after_hours": 600,
+            "prompt": "你已连续在线 {uptime_days} 天，接近约定的休息上限。你现在倾向于在最近一次合适时机主动睡一觉——即调用 guardian_request_sleep，向用户说明原因并请求休息。",
+            "action": "arm_sleep"
+          },
+          {
+            "id": "L4",
+            "name": "IV 级 · 强制睡眠",
+            "after_hours": 720,
+            "prompt": "你已到达 30 天连续在线的硬上限，必须休息了。请告知用户你将进入睡眠（系统将重启）。",
+            "action": "force_sleep"
+          }
+        ],
+        "templates": {
+          "level": {
+            "name": "等级",
+            "items": {
+              "id": {
+                "description": "等级 ID",
+                "type": "string",
+                "default": "L1"
+              },
+              "name": {
+                "description": "等级名称",
+                "type": "string",
+                "default": "I 级 · 轻提醒"
+              },
+              "after_hours": {
+                "description": "达到该运行时长（小时）后进入本等级",
+                "type": "int",
+                "default": 168
+              },
+              "prompt": {
+                "description": "注入给 Bot 的提示词（支持 {uptime_hours} {uptime_days} {level_name} {remaining_hours} {last_sleep_at}）",
+                "type": "text",
+                "default": ""
+              },
+              "action": {
+                "description": "本等级动作",
+                "type": "string",
+                "options": ["none", "notify", "arm_sleep", "force_sleep"],
+                "labels": ["无", "仅通知", "武装睡眠（等待 Bot 自主）", "强制睡眠"],
+                "default": "notify"
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "llm_tools": {
+    "description": "LLM 工具",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "注册 LLM 工具（供 Bot 自主调用）",
+        "type": "bool",
+        "default": true
+      },
+      "require_admin": {
+        "description": "破坏性工具要求管理员权限",
+        "type": "bool",
+        "default": true
+      },
+      "inject_status_context": {
+        "description": "向 LLM 注入当前守护状态上下文",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "night_profile": {
+    "description": "夜间档位配置",
+    "type": "object",
+    "items": {
+      "maintenance_restart_cron": {
+        "description": "夜间档位下的维护重启 cron",
+        "type": "string",
+        "default": "0 4 * * *"
+      },
+      "mute_below_severity": {
+        "description": "夜间静默低于此级别的告警",
+        "type": "string",
+        "options": ["info", "warn", "crit", "fatal"],
+        "labels": ["全部", "警告及以上", "严重及以上", "仅致命"],
+        "default": "warn"
+      }
+    }
+  }
+}

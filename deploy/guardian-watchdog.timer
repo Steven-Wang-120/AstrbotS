@@ -1,0 +1,13 @@
+# Check host requests and persisted wake deadlines every 30 seconds.
+[Unit]
+Description=Guardian Watchdog Timer (poll requests and wake deadlines)
+Requires=guardian-watchdog.service
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=30s
+AccuracySec=5s
+Unit=guardian-watchdog.service
+
+[Install]
+WantedBy=timers.target

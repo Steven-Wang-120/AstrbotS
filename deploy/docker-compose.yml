@@ -1,0 +1,53 @@
+# Guardian 守护系统 —— Arch Linux + Docker Compose 双容器编排示例
+# 对应文档：B13
+#
+# 关键点：
+#   1. astrbot 容器挂载 /var/run/docker.sock 以便插件读取容器状态并执行重启
+#   2. group_add 使用宿主机 docker 组 GID（用 `stat -c '%g' /var/run/docker.sock` 获取）
+#   3. ./data 同时挂到宿主，便于宿主机看门狗读取重启请求文件
+#   4. 两个容器都设 restart: unless-stopped，保证被重启后能自动回来
+
+name: astrbot-stack
+
+services:
+  napcat:
+    image: mlikiowa/napcat-docker:latest
+    container_name: napcat
+    restart: unless-stopped
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - NAPCAT_UID=${NAPCAT_UID:-0}
+      - NAPCAT_GID=${NAPCAT_GID:-0}
+    ports:
+      - "3000:3000"   # OneBot 11 HTTP
+      - "6099:6099"   # NapCat WebUI
+    volumes:
+      - ./napcat/config:/app/napcat/config
+      - ./napcat/qq:/app/.config/QQ
+    networks:
+      - astrbot-net
+
+  astrbot:
+    image: soulter/astrbot:latest
+    container_name: astrbot
+    restart: unless-stopped
+    depends_on:
+      - napcat
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+    ports:
+      - "6185:6185"   # AstrBot WebUI
+      - "6199:6199"   # AstrBot 额外端口
+    volumes:
+      - ./data:/AstrBot/data
+      # 让插件直接读写宿主机 Docker（必需）
+      - /var/run/docker.sock:/var/run/docker.sock
+    # 把容器进程加入宿主 docker 组，避免 socket 权限拒绝
+    group_add:
+      - "${DOCKER_GID:-999}"
+    networks:
+      - astrbot-net
+
+networks:
+  astrbot-net:
+    driver: bridge
