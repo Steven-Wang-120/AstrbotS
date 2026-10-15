@@ -225,6 +225,24 @@ def test_sleep_armed_is_released_when_uptime_falls():
     assert st.sleep_armed is False, "武装状态必须随等级回落而解除，不得粘滞"
 
 
+def test_config_normalization_issues_are_surfaced_by_self_check():
+    """缺陷（实机复现）：config.issues 被收集但**无人消费**，非法/被夹取的配置静默生效。
+
+    实机操作：把 `lifecycle.max_uptime_hours` 调成 0.1（想快速触发硬上限）——
+    插件会把它抬回"最高等级阈值"(720)，但日志与 WebUI 都毫无提示，
+    "30 天必定真睡一次"这条承诺被悄悄改写而运维不可见。
+    """
+    guard, cfg, _st, _au = make_safety(lifecycle={
+        "max_uptime_hours": 1,
+        "levels": [{"id": "L0", "name": "a", "after_hours": 0, "action": "none"},
+                   {"id": "L4", "name": "d", "after_hours": 720, "action": "force_sleep"}]})
+    assert cfg.issues, "validate() 应记录 max_uptime_hours 被抬高的 issue"
+    assert cfg.lifecycle.max_uptime_hours == 720.0, "应被抬到最高等级阈值"
+    warns = guard.self_check()
+    assert any("配置归一化" in w for w in warns), warns
+    assert any("max_uptime_hours" in w for w in warns), warns
+
+
 def test_render_prompt_replaces_all_placeholders():
     pol = LifecyclePolicy(levels=[LevelSpec("L0", "a", 0, "", "none"),
                                   LevelSpec("L1", "b", 168, "", "notify")],

@@ -107,6 +107,11 @@ class SafetyGuard:
     def self_check(self) -> list[str]:
         """启动自检，返回告警清单。"""
         warns: list[str] = []
+        # 配置层在归一化过程中收集的 issues（非法值回退、阈值被抬高、参数被夹取…）
+        # 必须在这里浮出来。否则 `max_uptime_hours` 被静默抬高、或非法值被静默回退，
+        # 运维在 WebUI 与日志里都看不到，"30 天必定真睡一次"这条承诺就被悄悄破坏了。
+        for issue in getattr(self.config, "issues", []) or []:
+            warns.append(f"配置归一化：{issue}")
         allow = self.config.action_allowlist
         if not allow:
             warns.append("动作白名单为空：所有自动重启都会被拒绝")
