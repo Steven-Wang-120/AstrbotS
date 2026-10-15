@@ -171,8 +171,14 @@ class LifecyclePolicy:
                 st.last_inject_at = now
                 st.last_inject_level = spec.id
 
-        if action == "arm_sleep":
-            st.sleep_armed = True
+        # 武装状态**每轮按当前等级重算**，不做单向闩锁。
+        #
+        # 曾经这里是 `if action == "arm_sleep": st.sleep_armed = True`，只置真不置假：
+        # 一旦某轮命中 arm_sleep 等级，此后即使 uptime 回落（某个 uptime_targets
+        # 容器被重启 / 时钟校正）让等级降回 L0，武装状态仍然为真。而适配层把
+        # `sleep_armed` 直接当作"权威路径"，会同时跳过管理员校验与二次确认——
+        # 于是一张"免确认通行证"会在等级早已回落后长期有效。改为每轮重算即可根除。
+        st.sleep_armed = action == "arm_sleep"
 
         return {
             "level_index": idx,

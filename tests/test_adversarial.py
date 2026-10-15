@@ -209,11 +209,11 @@ def test_sleep_armed_is_cleared_by_sleep_done():
     assert st.level_id == "L0"
 
 
-def test_sleep_armed_sticky_when_uptime_falls():
-    """B16 交接文档点名的开放项：uptime 回落（容器被重启）后武装状态是否该清？
+def test_sleep_armed_is_released_when_uptime_falls():
+    """B16 交接文档点名的开放项：uptime 回落（容器被重启）后武装状态必须解除。
 
-    这里只断言"当前实现的行为"，用于把差异钉死成可见事实——
-    若期望变更，改这一条即可，不会静默漂移。
+    修复前 `evaluate()` 只单向置真（`if action == "arm_sleep": sleep_armed = True`），
+    等级已回落仍长期持有"免确认通行证"；现改为每轮按当前等级重算。
     """
     pol = LifecyclePolicy(levels=[LevelSpec("L0", "a", 0, "", "none"),
                                   LevelSpec("L3", "c", 600, "", "arm_sleep")],
@@ -222,7 +222,7 @@ def test_sleep_armed_sticky_when_uptime_falls():
     pol.evaluate(600.0, st)
     assert st.sleep_armed is True
     pol.evaluate(1.0, st)          # uptime 归零（容器重启）
-    assert st.sleep_armed is True, "当前实现：武装状态粘滞，不随 uptime 回落清除"
+    assert st.sleep_armed is False, "武装状态必须随等级回落而解除，不得粘滞"
 
 
 def test_render_prompt_replaces_all_placeholders():

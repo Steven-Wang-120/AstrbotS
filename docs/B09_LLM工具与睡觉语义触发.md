@@ -5,7 +5,7 @@
 > **v0.2.0 增量（必读，覆盖本文的「睡觉」语义实现）**：B00 v0.2 明确三条约束——
 > ① **禁止关键词触发**：插件层绝不匹配"睡觉/晚安"等词；触发源仅调度器巡检 / 生命周期等级推进 / Bot 主动调用工具；
 > ② 「睡觉」由**生命周期等级**推进：等级阈值前端可配（`lifecycle.levels`），每级注入**不同提示词**引导 Bot 自主决定；
-> ③ 工具集调整：删除 `guardian_enter_night_watch`，新增 `guardian_request_sleep(reason, duration_min)` 与 `guardian_lifecycle_status()`；30 天硬上限由插件强制睡眠兜底。
+> ③ 工具集调整：删除 `guardian_enter_night_watch`，新增 `guardian_request_sleep(reason, duration_min, confirm)` 与 `guardian_lifecycle_status()`；30 天硬上限由插件强制睡眠兜底。**`guardian_request_sleep` 属破坏性工具（会重启睡眠目标容器），与 `guardian_restart_container` 一样需 `confirm=true` 二次确认（§6.2）。**
 > 提示词注入改用 `@filter.on_llm_request()` 的 `extra_user_content_parts`（不要写 system_prompt）。完整设计见 `B15`。
 
 ## 1. 目标
@@ -31,6 +31,7 @@
 | `guardian_diagnose` | `target`(枚举) | 白名单容器 ∪ `qq` ∪ `docker` ∪ ROS2 期望节点 | 只读诊断，不改状态 | 所有用户 |
 | `guardian_list_incidents` | `limit`(1-50) | 缺省 10 | 只读环形缓冲，含被静默/抑制事件 | 所有用户 |
 | `guardian_restart_container` | `container`(枚举=白名单) | `managed ∪ allowed_containers`；`confirm` 二次确认 | **重启容器**（dry-run 仅记录） | 管理员 + 确认 |
+| `guardian_request_sleep` | `reason`(string), `duration_min`(0-120), `confirm`(boolean) | `reason` 截断 200 字；`duration_min` 越界夹取；`confirm` 二次确认（生命周期 `armed` 权威路径可免） | **真睡眠**：重启 `lifecycle.sleep_targets`（dry-run 仅记录） | 管理员 + 确认；⚠️ `armed=true` 时**全放行**（免管理员校验 + 免二次确认，仅剩 SafetyGuard） |
 | `guardian_set_mode` | `mode`(server\|ros2) | — | `switch_mode`：停表→等在途→重建探针→重置冷却→落盘→通知 | 管理员 |
 | `guardian_set_profile` | `profile`(枚举) | normal/night/maintenance/aggressive | `set_profile`：重排 interval + 静默级别 | 管理员 |
 | `guardian_enter_night_watch` | `reason`(string), `hours`(number) | `reason` 截断 120 字；`hours` 1-24 缺省 8 | 切 `night` + 写 `night_until` + 预约维护重启 + 静默低级别告警 | 所有用户（低风险自愈） |

@@ -374,6 +374,88 @@ def test_llm_tool_admin_gate():
     run(main())
 
 
+def test_destructive_tool_confirm_gate_and_armed_bypass():
+    """B09 §6.2 / §179-201、B15 §9 A3：破坏性工具二次确认 + armed 全放行语义。
+
+    - `confirm=false`：只回确认提示，**绝不**进入安全链/执行
+    - `confirm=true` ：执行
+    - `armed=true`   ：**全放行**（免管理员校验 + 免二次确认）——有意设计，非缺陷
+    """
+    async def main():
+        p, _ctx = make_plugin()
+        rt = p.runtime
+        rt.config.raw["dry_run"] = False
+        rt.config.raw["safety"]["allowed_containers"] = ["napcat"]
+        rt.config.raw["containers"]["managed"] = ["napcat"]
+        rt.config.raw["lifecycle"]["sleep_targets"] = ["napcat"]
+        rt.config.refresh()
+
+        calls: list[tuple] = []
+
+        async def rec_restart(name, **kw):
+            calls.append(("restart", name))
+            return True, "ok"
+
+        async def rec_sleep(reason, dur, **kw):
+            calls.append(("sleep", dur, kw.get("bypass_confirm")))
+            return True, "ok"
+
+        rt.request_restart = rec_restart
+        rt.request_sleep = rec_sleep
+
+        async def tool_text(fn, *a, **kw):
+            out = []
+            async for c in fn(*a, **kw):
+                out.append(c[1])
+            return out[0]
+
+        # 1) restart confirm=false -> 提示且不执行
+        t = await tool_text(p.guardian_restart_container, AstrMessageEvent("x"), "napcat")
+        assert "确认执行" in t and calls == [], (t, calls)
+
+        # 2) restart confirm=true -> 执行
+        t = await tool_text(p.guardian_restart_container, AstrMessageEvent("x"),
+                            "napcat", confirm=True)
+        assert calls == [("restart", "napcat")], (t, calls)
+        calls.clear()
+
+        # 3) sleep：非管理员且未武装 -> 管理员校验拒绝
+        t = await tool_text(p.guardian_request_sleep,
+                            AstrMessageEvent("x", admin=False), "累", 0)
+        assert "管理员" in t and calls == [], (t, calls)
+
+        # 4) sleep：管理员 confirm=false -> 二次确认提示且不执行
+        t = await tool_text(p.guardian_request_sleep, AstrMessageEvent("x"), "累", 0)
+        assert "确认执行" in t and calls == [], (t, calls)
+
+        # 5) sleep：管理员 confirm=true -> 执行（bypass_confirm=True 下传引擎）
+        t = await tool_text(p.guardian_request_sleep, AstrMessageEvent("x"),
+                            "累", 0, True)
+        assert calls == [("sleep", 0, True)], (t, calls)
+        calls.clear()
+
+        # 6) sleep：armed=true + **非管理员** -> 全放行（B15 §9 A3 有意设计）
+        rt.engine.lifecycle_state.sleep_armed = True
+        t = await tool_text(p.guardian_request_sleep,
+                            AstrMessageEvent("x", admin=False), "累", 0)
+        assert calls == [("sleep", 0, True)], (t, calls)
+
+    run(main())
+
+
+def test_engine_request_sleep_enforces_confirmation_gate():
+    """引擎层强制闸门（纵深防御）：非权威来源未确认时必须拒绝并写审计。"""
+    async def main():
+        p, _ctx = make_plugin()
+        rt = p.runtime
+        ok, detail = await rt.engine.request_sleep("x", 0, actor="llm", trigger="llm")
+        assert ok is False and "二次确认" in detail, (ok, detail)
+        assert any(e.get("kind") == "sleep.confirm_required"
+                   for e in rt.audit.tail(50)), "缺少 sleep.confirm_required 审计"
+
+    run(main())
+
+
 def test_lifecycle_hard_deadline_forces_sleep_in_dry_run():
     """30 天硬上限：dry-run 下应记录但不真正重启；本体受保护时优雅降级。"""
     async def main():

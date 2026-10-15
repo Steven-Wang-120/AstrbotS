@@ -130,7 +130,13 @@ async def request_sleep(rt, reason: str, duration_min: float = 0,
         return f"（dry-run 模式）睡眠未真正执行：{detail}"
 
     if not armed:
-        # 未到 arm_sleep 等级时，需管理员权限；此处由工具层直接执行但记录来源
+        # 未到 arm_sleep 等级时需管理员权限（L-T）；armed 时**有意**跳过该校验。
+        #
+        # ⚠️ 这是已确认的设计（B15 §9 A3），不是遗漏：armed 表示"生命周期已推进到
+        # 该休息的等级"，此时 Bot 的睡眠请求被视作已授权，L-T 与 L-D 一并放行，
+        # 只保留 SafetyGuard（L-S）的白名单/冷却/熔断/dry-run。代价是：任意用户的
+        # 会话在武装窗口内都可能引导 LLM 触发一次真睡眠。面向不可信用户群部署时，
+        # 应同时收紧 require_admin 与等级配置，而不是改这里。
         allowed, msg = check_admin(rt, is_admin)
         if not allowed:
             return (msg + " 若确实需要，可等待生命周期等级推进到"
