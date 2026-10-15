@@ -43,6 +43,9 @@ from .utils.textutil import fmt_ts
 
 PLUGIN_NAME = "astrbot_plugin_guardian"
 
+#: 内核版本（随 IPC `ping` / `kernel_ready` 事件回传，便于两端版本对齐排查）
+KERNEL_VERSION = "0.3.0"
+
 #: 内核默认数据目录（域 A 自己的数据目录，B16 §7）。
 #: 适配层可以覆盖（传入 AstrBot 规范目录），独立进程则可用环境变量指定。
 DEFAULT_DATA_DIR_ENV = "GUARDIAN_DATA_DIR"
@@ -68,6 +71,7 @@ class GuardianKernel:
                  sender: Sender | None = None,
                  action_caller: ActionCaller | None = None) -> None:
         self.data_dir = data_dir or default_data_dir()
+        self.version = KERNEL_VERSION
         self.config: GuardianConfig = build_config(raw_config, data_dir=self.data_dir)
 
         self._sender = sender
@@ -304,6 +308,102 @@ class GuardianKernel:
             return False, f"非法档位 {profile}"
         await self.engine.apply_profile(profile, reason="手动切换")
         return True, f"档位已切换为 {profile}"
+
+    # ================================================================== #
+    # 域 B 适配所需的能力（B16 §10 契约补充）
+    # ================================================================== #
+    def set_sender(self, sender: Sender | None) -> None:
+        """注入/替换通知发送器。
+
+        独立内核进程启动时 `sender=None`，随后由 `KernelIpcServer` 把通知改道成
+        IPC 事件广播。`Notifier` 持有的是 `self._send` 这个**延迟绑定**的包装，
+        所以替换后立刻生效，无需重建 Notifier。
+        """
+        self._sender = sender
+
+    def runtime_flags(self) -> dict[str, Any]:
+        """适配层做 L-D 二次确认所需的**权威**开关。
+
+        必须由内核回答：适配层若拿自己那份配置副本判断 `dry_run`，两份配置一旦
+        漂移，就会出现"适配层以为在 dry-run、内核其实已关"的无确认真睡眠。
+        """
+        return {
+            "enabled": bool(self.config.enabled),
+            "dry_run": bool(self.config.dry_run),
+            "lifecycle_enabled": bool(self.config.lifecycle.enabled),
+            "require_admin": bool(self.config.llm_tools.require_admin),
+            "sleep_targets": list(self.config.lifecycle.sleep_targets or []),
+        }
+
+    def sleep_armed(self) -> bool:
+        return bool(self.engine.lifecycle_state.sleep_armed)
+
+    def level_prompt(self) -> str:
+        """当前等级注入提示词（`on_llm_request` 注入源）。"""
+        return str(self.state.get("lifecycle.inject_prompt") or "")
+
+    def status_context(self) -> str:
+        """`<guardian_status>` 状态块（原 `tools/llm_tools.build_status_context`）。
+
+        搬到内核是为了让适配层在 `kernel.mode=ipc` 下不必去读 `state`/`engine`
+        ——那会直接违反 I2（适配层无状态、不读内核业务状态）。
+        """
+        st = self.engine.lifecycle_state
+        return (
+            "<guardian_status>\n"
+            f"守护模式: {self.state.get('mode')}\n"
+            f"运行档位: {self.state.get('profile')}\n"
+            f"系统已连续运行: {st.uptime_hours:.1f} 小时\n"
+            f"生命周期等级: {st.level_id} {st.level_name}\n"
+            "（这是系统内部状态，供你判断是否需要安排休息，不必逐字复述。）\n"
+            "</guardian_status>"
+        )
+
+    def llm_injection(self) -> dict[str, Any]:
+        """一次调用返回 LLM 注入所需的全部素材。
+
+        注入发生在**每次** LLM 请求上，是最热路径；拆成多次 IPC 往返会让每次
+        对话都多付几次往返延迟。所以这里合成一次调用。
+        """
+        blocks: list[str] = []
+        level = ""
+        prompt = self.level_prompt()
+        if self.config.lifecycle.enabled and prompt:
+            level = str(self.state.get("lifecycle.inject_level") or "")
+            blocks.append(
+                f'<lifecycle_guard level="{level}">\n{prompt}\n'
+                "（这是系统内部状态提示，请自然融入你的行为，不要逐字复述。）\n"
+                "</lifecycle_guard>")
+        if self.config.llm_tools.inject_status_context:
+            blocks.append(self.status_context())
+        return {
+            "text": "\n".join(blocks),
+            "mode": str(self.config.lifecycle.inject_mode or "extra_user_content"),
+            "level": level,
+        }
+
+    def lifecycle_status_text(self) -> str:
+        """生命周期状态文本（原 `tools/llm_tools.lifecycle_status`）。"""
+        st = self.engine.lifecycle_state
+        lc = self.config.lifecycle
+        lines = self.engine.lifecycle_text().splitlines()
+        return (
+            "生命周期状态：\n"
+            f"- {self.lifecycle_policy.describe(st)}\n"
+            f"- 硬上限: {float(lc.max_uptime_hours):.0f}h"
+            f"（{float(lc.max_uptime_hours) / 24:.0f} 天），"
+            f"到达强制睡眠: {'是' if lc.force_sleep_on_deadline else '否'}\n"
+            f"- 当前注入等级: {self.state.get('lifecycle.inject_level') or '(无)'}\n"
+            f"- 睡眠目标: {', '.join(lc.sleep_targets) or '(未配置)'}\n"
+            f"- 最近睡眠: {lines[-1] if lines else '(无记录)'}"
+        )
+
+    def audit_append(self, *, kind: str, target: str = "", detail: str = "",
+                     ok: bool = True, actor: str = "llm",
+                     trigger: str = "llm", **extra: Any) -> None:
+        """适配层代内核记一条审计（I1：`audit.jsonl` 仍是内核单写者）。"""
+        self.audit.append(kind=kind, target=target, detail=detail, ok=ok,
+                          actor=actor, trigger=trigger, **extra)
 
     # ================================================================== #
     # 只读查询

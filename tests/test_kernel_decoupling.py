@@ -34,7 +34,8 @@ from pathlib import Path  # noqa: E402
 PLUGIN = Path(SRC) / "astrbot_plugin_guardian"
 
 #: 内核侧包：这些包必须能在没有 astrbot 的进程里导入。
-KERNEL_PACKAGES = ("core", "probes", "utils", "actions", "notify", "modes", "tools")
+KERNEL_PACKAGES = ("core", "probes", "utils", "actions", "notify", "modes", "tools",
+                   "ipc", "kernel")
 
 #: 内核侧**顶层**模块（不属于上面的包，但同样必须能脱离 astrbot 导入）。
 #: M1 之后内核装配被拆到 kernel_runtime.py，它必须保持零 astrbot 依赖。

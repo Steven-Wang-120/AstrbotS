@@ -537,6 +537,115 @@
       }
     }
   },
+  "kernel": {
+    "description": "独立内核（B16：内核/适配层/看门狗三域分离）",
+    "type": "object",
+    "items": {
+      "mode": {
+        "description": "内核运行形态",
+        "type": "string",
+        "options": ["inproc", "ipc", "sidecar"],
+        "labels": ["同进程（默认，M1 形态 / 回滚路径）", "IPC（独立内核进程）", "sidecar（= ipc，B00 §7 用词）"],
+        "default": "inproc",
+        "hint": "改为 ipc 前需先按 deploy/ 部署 guardian-kernel 服务，否则工具面会报「内核不可用」"
+      },
+      "transport": {
+        "description": "IPC 传输方式",
+        "type": "string",
+        "options": ["auto", "unix", "tcp"],
+        "labels": ["自动（Unix socket 优先，TCP 回退）", "Unix socket", "loopback TCP"],
+        "default": "auto"
+      },
+      "socket_path": {
+        "description": "Unix socket 路径（留空 = <共享卷>/guardian/kernel.sock）",
+        "type": "string",
+        "default": ""
+      },
+      "tcp_host": {
+        "description": "TCP 监听地址（只允许 loopback）",
+        "type": "string",
+        "default": "127.0.0.1",
+        "hint": "内核绝不暴露到网络；填非 loopback 会被强制回 127.0.0.1"
+      },
+      "tcp_port": {
+        "description": "TCP 端口（0 = 让内核自选，实际端口见 kernel_heartbeat.json）",
+        "type": "int",
+        "default": 6198
+      },
+      "token_file": {
+        "description": "TCP 鉴权令牌文件（留空 = <共享卷>/guardian/kernel.token）",
+        "type": "string",
+        "default": ""
+      },
+      "shared_dir": {
+        "description": "内核与适配层共享卷（留空 = 数据目录）",
+        "type": "string",
+        "default": ""
+      },
+      "request_timeout": {
+        "description": "单次 IPC 调用超时（秒）",
+        "type": "int",
+        "default": 10
+      },
+      "heartbeat_interval": {
+        "description": "内核写心跳的间隔（秒）",
+        "type": "int",
+        "default": 30
+      },
+      "heartbeat_timeout": {
+        "description": "看门狗判定内核卡死的阈值（秒）",
+        "type": "int",
+        "default": 90,
+        "hint": "必须大于 heartbeat_interval，否则会把健康内核误判为卡死"
+      },
+      "max_auto_reloads": {
+        "description": "自修复次数上限（0 = 不自动重载）",
+        "type": "int",
+        "default": 1,
+        "hint": "有界防崩溃循环；用尽后进入 kernel_degraded 等人工介入或 /guardian reset"
+      },
+      "reload_cooldown": {
+        "description": "自修复冷却间隔（秒）",
+        "type": "int",
+        "default": 600
+      },
+      "reload_grace_sec": {
+        "description": "重载后宽限期（秒）",
+        "type": "int",
+        "default": 90
+      },
+      "reload_reset_sec": {
+        "description": "内核稳定多久后复位自修复额度（秒）",
+        "type": "int",
+        "default": 300
+      },
+      "reload_request_path": {
+        "description": "内核重载请求文件路径（留空 = 共享卷下默认）",
+        "type": "string",
+        "default": ""
+      },
+      "health_path": {
+        "description": "适配层自修复计数文件路径（留空 = 共享卷下默认）",
+        "type": "string",
+        "default": ""
+      },
+      "adapter_events_path": {
+        "description": "适配层事件流路径（留空 = 共享卷下默认）",
+        "type": "string",
+        "default": ""
+      },
+      "unreachable_notify_after": {
+        "description": "内核掉线多久后由适配层主动告警（秒）",
+        "type": "int",
+        "default": 90
+      },
+      "direct_actions": {
+        "description": "内核直连 docker.sock 执行动作（M5；false 则回到「经看门狗」）",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
   "night_profile": {
     "description": "夜间档位配置",
     "type": "object",

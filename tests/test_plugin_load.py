@@ -254,13 +254,16 @@ def test_commands_and_hooks_registered():
 
 
 def test_runtime_assembly_and_status():
-    p, _ctx = make_plugin()
-    assert p.runtime.config.dry_run is True
-    assert set(p.runtime.allowlist()) == {"astrbot", "napcat"}
-    text = p.runtime.status_text()
-    assert "守护系统健康快照" in text
-    assert "生命周期" in text
-    assert "尚未执行过巡检" in text
+    async def main():
+        p, _ctx = make_plugin()
+        assert p.runtime.config.dry_run is True
+        assert set(await p.runtime.allowlist()) == {"astrbot", "napcat"}
+        text = await p.runtime.status_text()
+        assert "守护系统健康快照" in text
+        assert "生命周期" in text
+        assert "尚未执行过巡检" in text
+
+    run(main())
 
 
 def test_start_and_stop_are_clean():

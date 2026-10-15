@@ -1,11 +1,14 @@
-# Guardian 守护系统 —— Arch Linux + Docker Compose 双容器编排示例
-# 对应文档：B13
+# Guardian 守护系统 —— Arch Linux + Docker Compose 三容器编排示例
+# 对应文档：B13（基础部署）、B16（独立内核三域分离）
 #
 # 关键点：
 #   1. astrbot 容器挂载 /var/run/docker.sock 以便插件读取容器状态并执行重启
 #   2. group_add 使用宿主机 docker 组 GID（用 `stat -c '%g' /var/run/docker.sock` 获取）
 #   3. ./data 同时挂到宿主，便于宿主机看门狗读取重启请求文件
-#   4. 两个容器都设 restart: unless-stopped，保证被重启后能自动回来
+#   4. 三个容器都设 restart: unless-stopped，保证被重启后能自动回来
+#   5. guardian-kernel 是 B16 的**域 A**：独立进程，不再随 astrbot 重启而死，
+#      因此"重启 astrbot"不再是自杀（S1 根治）。启用它需要把插件配置里的
+#      kernel.mode 从 inproc 改成 ipc，并让两边的 kernel.shared_dir 指向同一处。
 
 name: astrbot-stack
 
@@ -43,6 +46,43 @@ services:
       # 让插件直接读写宿主机 Docker（必需）
       - /var/run/docker.sock:/var/run/docker.sock
     # 把容器进程加入宿主 docker 组，避免 socket 权限拒绝
+    group_add:
+      - "${DOCKER_GID:-999}"
+    networks:
+      - astrbot-net
+
+  # ------------------------------------------------------------------ #
+  # 域 A：守护内核（B16 §3 / D1-a 同栈 sidecar）
+  #
+  # 部署步骤：
+  #   1. docker build -f deploy/kernel/Dockerfile -t guardian-kernel:local .
+  #   2. 把 deploy/kernel/kernel_config.example.json 拷到 ./data/guardian/kernel_config.json
+  #      并按实际容器名/白名单/通知目标改好
+  #   3. 在 AstrBot WebUI 里把 Guardian 插件配置的 kernel.mode 改成 ipc，
+  #      kernel.shared_dir 设为 /AstrBot/data（与下面挂载一致）
+  #   4. docker compose up -d guardian-kernel，然后重载 Guardian 插件
+  #
+  # 只读验证：docker exec guardian-kernel python -m astrbot_plugin_guardian.kernel --print-config
+  # 冒烟验证：docker run --rm --network astrbot-stack_astrbot-net \
+  #             -v "$PWD/data:/AstrBot/data" guardian-kernel:local --selftest
+  # ------------------------------------------------------------------ #
+  guardian-kernel:
+    build:
+      context: ..
+      dockerfile: deploy/kernel/Dockerfile
+    image: guardian-kernel:local
+    container_name: guardian-kernel
+    restart: unless-stopped
+    depends_on:
+      - astrbot
+    environment:
+      - TZ=${TZ:-Asia/Shanghai}
+      - GUARDIAN_CONFIG_FILE=/AstrBot/data/guardian/kernel_config.json
+    volumes:
+      # 与 astrbot 共享同一份数据卷：IPC socket / 心跳 / 请求文件都落在这里
+      - ./data:/AstrBot/data
+      # D2-b：内核直连 docker.sock 执行动作（不再经看门狗）
+      - /var/run/docker.sock:/var/run/docker.sock
     group_add:
       - "${DOCKER_GID:-999}"
     networks:

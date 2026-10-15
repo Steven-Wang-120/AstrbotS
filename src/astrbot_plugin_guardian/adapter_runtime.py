@@ -1,22 +1,43 @@
 """Guardian 守护系统 —— AstrBot 适配层运行时（域 B）。
 
-对应文档：B16 §5.2/§5.3、B16 §6.3
+对应文档：B16 §5.2/§5.3、§6.3、§12.3.3
 
 职责边界（**不变量 I2**）：
 - 只做"对接 AstrBot 面"：解析数据目录、把通知文本包装成消息链发送、向已运行的
   反向 WebSocket 发只读 OneBot 查询、把 LLM 工具/命令的调用转交内核。
 - **无状态、无策略、无 docker 权限**，不跑任何巡检。
 
-业务逻辑一律在 `kernel_runtime.py`（域 A）。本模块是 AstrBot 与内核之间唯一的
-"脏"边界；除 `main.py` 与本文件外，插件内任何模块都不得 `import astrbot`。
+本模块通过 `kernel.mode` 选择内核访问后端（`ipc/backend.py`）：
+
+- `inproc`（默认）：同进程直连内核 —— M1 旧形态，也是 M2 的**回滚路径**（I5）；
+- `ipc`：走 Unix socket / TCP 到独立内核进程。
+
+两种模式下**对外方法签名完全一致**，因此 `main.py` 与 `tools/llm_tools.py`
+不需要知道内核跑在哪里。业务逻辑一律在 `kernel_runtime.py`（域 A）。
+
+除 `main.py` 与本文件外，插件内任何模块都不得 `import astrbot`。
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
+import time
 from typing import Any
 
+from .core.config import build_config
+from .core.log import logger
+from .ipc.backend import IpcBackend, LocalBackend
+from .ipc.client import KernelIpcClient
+from .ipc.protocol import EV_NOTIFY, IpcError
 from .kernel_runtime import PLUGIN_NAME, GuardianKernel, default_data_dir  # noqa: F401
+
+#: `note_event` 的合并窗口：每条用户消息都发一次 IPC 太贵，10s 内合并成一次。
+NOTE_EVENT_COALESCE_SEC = 10.0
+
+#: L4 掉线告警的轮询间隔
+OUTAGE_POLL_SEC = 15.0
 
 # --------------------------------------------------------------------------- #
 # 消息链构造（跨版本兼容）
@@ -98,37 +119,92 @@ def _forward(name: str) -> property:
 
     必须可写：拆分前的 `GuardianRuntime` 是普通对象，测试与诊断脚本会直接
     `rt.state = fake` / `rt.lifecycle_policy = build_policy(...)` 来替换依赖。
-    只读属性会让这些既有用法抛 `AttributeError: ... has no setter`，
-    那就不算"对外表面不变"。
+    只读属性会让这些既有用法抛 `AttributeError: ... has no setter`。
+
+    `kernel.mode=ipc` 时 `self.kernel` 为 None，此时访问这些属性会给出**可读的
+    边界错误**而不是 `AttributeError: 'NoneType'`——因为这通常意味着有代码
+    越过了 I2 边界去直接读内核业务状态。
     """
     def getter(self):
-        return getattr(self.kernel, name)
+        kernel = self.__dict__.get("kernel")
+        if kernel is None:
+            raise AttributeError(
+                f"适配层在 kernel.mode=ipc 下不持有内核业务状态（{name}）。"
+                "请改用适配层的 async 方法（如 await rt.status_text()），"
+                "不要在适配层直接读内核状态（B16 不变量 I2）。")
+        return getattr(kernel, name)
 
     def setter(self, value):
-        setattr(self.kernel, name, value)
+        kernel = self.__dict__.get("kernel")
+        if kernel is None:
+            raise AttributeError(
+                f"kernel.mode=ipc 下无法替换内核属性 {name}（I2）")
+        setattr(kernel, name, value)
 
     return property(getter, setter)
 
 
 class GuardianAdapter:
-    """域 B 装配：把 AstrBot 的能力注入内核，并把业务属性透传给调用方。
+    """域 B 装配：把 AstrBot 的能力注入内核，并把业务调用转交内核。
 
-    对外表面与拆分前的 `GuardianRuntime` **完全一致**（config / state / engine /
-    audit / lifecycle_policy / status_text() / request_sleep() …），因此 `main.py`
-    与 `tools/llm_tools.py` 无需改动。
+    `inproc` 模式下对外表面与拆分前的 `GuardianRuntime` **完全一致**
+    （config / state / engine / audit / lifecycle_policy / …），
+    因此既有测试与诊断脚本无需改动。
     """
 
     def __init__(self, context, raw_config: dict | None) -> None:
         self.context = context
+        self.raw_config = dict(raw_config or {})
         self.data_dir = resolve_data_dir()
-        self.kernel = GuardianKernel(
-            raw_config,
-            data_dir=self.data_dir,
-            sender=self._send,
-            action_caller=self._call_onebot,
-        )
 
-    # ---- 业务属性透传到内核（显式列出，避免 __getattr__ 的隐式与递归风险）---- #
+        # 只为"决定用哪个后端"而构建一次配置视图；内核实例自己会再构建一份。
+        self._cfg_view = build_config(self.raw_config, data_dir=self.data_dir)
+        kc = self._cfg_view.kernel
+        self.kernel_mode = str(kc.mode or "inproc")
+        self.shared_dir = str(kc.shared_dir or "") or self.data_dir
+
+        self.kernel: GuardianKernel | None = None
+        self.client: KernelIpcClient | None = None
+        self._backend: LocalBackend | IpcBackend
+        self._outage_task: asyncio.Task | None = None
+        self._last_note_ts = 0.0
+
+        if self.kernel_mode == "ipc":
+            self._backend = IpcBackend(self._build_client(kc))
+        else:
+            self.kernel = GuardianKernel(
+                self.raw_config,
+                data_dir=self.data_dir,
+                sender=self._send,
+                action_caller=self._call_onebot,
+            )
+            self._backend = LocalBackend(self.kernel)
+
+    # ------------------------------------------------------------------ #
+    def _build_client(self, kc) -> KernelIpcClient:
+        client = KernelIpcClient(
+            transport=str(kc.transport or "unix"),
+            socket_path=str(kc.socket_path or ""),
+            tcp_host=str(kc.tcp_host or "127.0.0.1"),
+            tcp_port=int(kc.tcp_port or 6198),
+            token_file=str(kc.token_file or ""),
+            shared_dir=self.shared_dir,
+            request_timeout=float(kc.request_timeout or 10),
+            max_auto_reloads=int(kc.max_auto_reloads or 0),
+            reload_cooldown=float(kc.reload_cooldown or 0),
+            reload_grace_sec=float(kc.reload_grace_sec or 0),
+            reload_reset_sec=float(kc.reload_reset_sec or 0),
+            reload_request_path=str(kc.reload_request_path or ""),
+            health_path=str(kc.health_path or ""),
+            adapter_events_path=str(kc.adapter_events_path or ""),
+            unreachable_notify_after=float(kc.unreachable_notify_after or 0),
+        )
+        client.on_event(self._on_kernel_event)
+        client.on_state(self._on_kernel_state)
+        self.client = client
+        return client
+
+    # ---- 业务属性透传到内核（仅 inproc 模式可用；ipc 模式访问即报错）---- #
     config = _forward("config")
     state = _forward("state")
     audit = _forward("audit")
@@ -144,58 +220,221 @@ class GuardianAdapter:
     ros2 = _forward("ros2")
     deps = _forward("deps")
 
+    # ================================================================== #
+    # 生命周期
+    # ================================================================== #
     async def start(self) -> None:
+        if self.kernel_mode == "ipc":
+            try:
+                await self._backend.start()
+                logger.info(f"[guardian] 适配层已连接内核 {self._endpoint}")
+            except IpcError as exc:
+                # 起不来不能把插件启动搞崩：工具面会在每次调用时给出显式错误（I4）
+                logger.error(f"[guardian] 适配层连接内核失败：{exc.user_text()}")
+            self._start_outage_watch()
+            return
+        assert self.kernel is not None
         await self.kernel.start()
 
     async def stop(self) -> None:
+        if self._outage_task is not None:
+            self._outage_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._outage_task
+            self._outage_task = None
+        if self.kernel_mode == "ipc":
+            await self._backend.stop()
+            return
+        assert self.kernel is not None
         await self.kernel.stop()
 
+    @property
+    def _endpoint(self) -> str:
+        backend = self._backend
+        if isinstance(backend, IpcBackend):
+            return backend.client.endpoint
+        return "inproc"
+
+    # ================================================================== #
+    # 统一调用入口（两种后端共用）
+    # ================================================================== #
+    async def _call(self, method: str, params: dict | None = None) -> Any:
+        return await self._backend.call(method, params)
+
+    # ================================================================== #
+    # 有副作用能力
+    # ================================================================== #
     async def run_check(self, scope: str = "all") -> dict[str, Any]:
-        return await self.kernel.run_check(scope)
+        return await self._call("run_check", {"scope": scope})
 
     async def request_restart(self, container: str, **kw) -> tuple[bool, str]:
-        return await self.kernel.request_restart(container, **kw)
+        return _unpair(await self._call("restart_container",
+                                        {"container": container, **kw}))
 
     async def request_start(self, container: str, **kw) -> tuple[bool, str]:
-        return await self.kernel.request_start(container, **kw)
+        return _unpair(await self._call("start_container",
+                                        {"container": container, **kw}))
 
     async def request_sleep(self, reason: str, duration_min: int = 0,
                             **kw) -> tuple[bool, str]:
-        return await self.kernel.request_sleep(reason, duration_min, **kw)
+        return _unpair(await self._call(
+            "request_sleep",
+            {"reason": reason, "duration_min": duration_min, **kw}))
 
     async def set_mode(self, mode: str) -> tuple[bool, str]:
-        return await self.kernel.set_mode(mode)
+        return _unpair(await self._call("set_mode", {"mode": mode}))
 
     async def set_profile(self, profile: str) -> tuple[bool, str]:
-        return await self.kernel.set_profile(profile)
+        return _unpair(await self._call("set_profile", {"profile": profile}))
 
-    def status_text(self) -> str:
-        return self.kernel.status_text()
+    async def note_event(self) -> None:
+        """记录一次用户消息活跃度（供 QQ 证据链）。
 
-    def lifecycle_text(self) -> str:
-        return self.kernel.lifecycle_text()
+        合并窗口：`observe_message` 对**每条**消息都会调用，若每条都发一次 IPC
+        往返，成本会随聊天频率线性上升。这里 10s 内合并成一次；窗口外的第一条
+        立即发送，保证"最近活跃时间"不会被拖太久。
+        """
+        now = time.time()
+        if now - self._last_note_ts < NOTE_EVENT_COALESCE_SEC:
+            return
+        self._last_note_ts = now
+        with contextlib.suppress(IpcError):
+            await self._call("note_event", {})
 
-    def health_report(self, scope: str = "all") -> str:
-        return self.kernel.health_report(scope)
+    async def audit_append(self, *, kind: str, target: str = "",
+                           detail: str = "", ok: bool = True,
+                           actor: str = "llm", trigger: str = "llm") -> None:
+        """适配层代内核记审计（I1：审计仍是内核单写者）。"""
+        if self.kernel_mode != "ipc":
+            assert self.kernel is not None
+            self.kernel.audit_append(kind=kind, target=target, detail=detail,
+                                     ok=ok, actor=actor, trigger=trigger)
+            return
+        with contextlib.suppress(IpcError):
+            await self._call("audit_append", {
+                "kind": kind, "target": target, "detail": detail, "ok": ok,
+                "actor": actor, "trigger": trigger})
 
-    def incidents_text(self, limit: int = 10) -> str:
-        return self.kernel.incidents_text(limit)
+    async def reset_kernel_health(self) -> str:
+        """`/guardian reset`：清零内核自修复额度。"""
+        backend = self._backend
+        if isinstance(backend, IpcBackend):
+            backend.reset()
+            return "已复位内核自修复额度（kernel_health.json）。"
+        return "当前为 inproc 模式，无自修复额度需要复位。"
 
-    def diagnose(self, target: str) -> str:
-        return self.kernel.diagnose(target)
+    # ================================================================== #
+    # 只读查询
+    # ================================================================== #
+    async def status_text(self) -> str:
+        return str(await self._call("status_text"))
 
-    def allowlist(self) -> list[str]:
-        return self.kernel.allowlist()
+    async def lifecycle_text(self) -> str:
+        return str(await self._call("lifecycle_text"))
 
-    def safety_warnings(self) -> list[str]:
-        return self.kernel.safety_warnings()
+    async def lifecycle_status_text(self) -> str:
+        return str(await self._call("lifecycle_status"))
 
-    def jobs_text(self) -> str:
-        return self.kernel.jobs_text()
+    async def health_report(self, scope: str = "all") -> str:
+        return str(await self._call("health_report", {"scope": scope}))
 
-    def note_event(self) -> None:
-        self.kernel.note_event()
+    async def incidents_text(self, limit: int = 10) -> str:
+        return str(await self._call("list_incidents", {"limit": limit}))
 
+    async def diagnose(self, target: str = "all") -> str:
+        return str(await self._call("diagnose", {"target": target}))
+
+    async def allowlist(self) -> list[str]:
+        return [str(x) for x in (await self._call("allowlist")) or []]
+
+    async def safety_warnings(self) -> list[str]:
+        return [str(x) for x in (await self._call("safety_warnings")) or []]
+
+    async def jobs_text(self) -> str:
+        return str(await self._call("jobs_text"))
+
+    async def status_context(self) -> str:
+        return str(await self._call("status_context"))
+
+    async def llm_injection(self) -> dict[str, Any]:
+        return dict(await self._call("injection") or {})
+
+    async def runtime_flags(self) -> dict[str, Any]:
+        return dict(await self._call("runtime_flags") or {})
+
+    async def sleep_armed(self) -> bool:
+        return bool(await self._call("sleep_armed"))
+
+    # ================================================================== #
+    # IPC 事件 / 状态
+    # ================================================================== #
+    async def _on_kernel_event(self, method: str, params: dict) -> None:
+        if method != EV_NOTIFY:
+            return
+        umo = str(params.get("umo") or "")
+        text = str(params.get("text") or "")
+        if not umo or not text:
+            return
+        try:
+            await self.context.send_message(umo, build_chain(text))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[guardian] 内核通知投递失败: {exc}")
+
+    async def _on_kernel_state(self, state: str, extra: dict) -> None:
+        if state == "disconnected":
+            logger.warning("[guardian] 与内核的 IPC 连接断开，开始自修复")
+        elif state == "reconnected":
+            logger.info(f"[guardian] 与内核的 IPC 连接已恢复（stage="
+                        f"{extra.get('stage')}）")
+        elif state == "degraded":
+            logger.error(f"[guardian] 内核进入降级状态：{extra.get('reason')}")
+
+    def _start_outage_watch(self) -> None:
+        """L4：内核掉线超过阈值时，由**适配层**主动推唯一一条"内核不可用"告警。
+
+        这条告警只能由适配层产生——内核就是挂掉的那个，它无法产生"我挂了"
+        （B16 §12.3.3 的递归陷阱）。
+        """
+        if self._outage_task is not None:
+            return
+        self._outage_task = asyncio.create_task(self._outage_loop())
+
+    async def _outage_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(OUTAGE_POLL_SEC)
+                backend = self._backend
+                if not isinstance(backend, IpcBackend):
+                    continue
+                if not backend.should_notify_outage():
+                    continue
+                await self._notify_kernel_unavailable(backend)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"[guardian] 掉线巡检异常: {exc}")
+
+    async def _notify_kernel_unavailable(self, backend: IpcBackend) -> None:
+        exc = backend.client._last_error or IpcError(
+            "kernel_unavailable", "IPC 未连接",
+            diagnostics=backend.diagnostics())
+        text = f"[守护] {exc.user_text()}\n请检查内核容器状态；若持续失败需人工介入。"
+        umos = list(getattr(self._cfg_view.notify, "umo_list", []) or [])
+        sent = 0
+        for umo in umos:
+            try:
+                await self.context.send_message(umo, build_chain(text))
+                sent += 1
+            except Exception as exc2:  # noqa: BLE001
+                logger.warning(f"[guardian] 内核不可用告警投递失败: {exc2}")
+        backend.audit_event("kernel_unavailable_notified",
+                            exc.user_text(), sent=sent)
+        logger.error(f"[guardian] 已推送内核不可用告警（{sent} 个目标）："
+                     f"{exc.user_text()}")
+
+    # ================================================================== #
+    # 兜底透传（仅 inproc 模式）
+    # ================================================================== #
     def __getattr__(self, item: str):
         """兜底透传：未显式声明的属性一律落到内核。
 
@@ -208,11 +447,12 @@ class GuardianAdapter:
             raise AttributeError(item)
         kernel = self.__dict__.get("kernel")
         if kernel is None:
-            raise AttributeError(item)
+            raise AttributeError(
+                f"kernel.mode=ipc 下适配层不持有内核对象，无法访问 {item}（I2）")
         return getattr(kernel, item)
 
     # ================================================================== #
-    # 注入给内核的两项能力
+    # 注入给内核的两项能力（仅 inproc 模式需要）
     # ================================================================== #
     async def _send(self, umo: str, text: str) -> None:
         await self.context.send_message(umo, build_chain(text))
@@ -226,7 +466,7 @@ class GuardianAdapter:
         from .utils.napcat import NapCatUnavailable
         if action not in {"get_status", "get_login_info"}:
             raise NapCatUnavailable("Guardian 仅允许只读登录态查询")
-        cfg = self.kernel.config
+        cfg = self._cfg_view
         platform_id = str(cfg.qq.platform_id or "").strip()
         if platform_id:
             getter = getattr(self.context, "get_platform_inst", None)
@@ -243,6 +483,15 @@ class GuardianAdapter:
         if cfg.qq.self_id:
             params["self_id"] = str(cfg.qq.self_id)
         return await client.call_action(action, **params)
+
+
+def _unpair(result: Any) -> tuple[bool, str]:
+    """把 IPC 的 `{"ok":…, "detail":…}` 还原成内核的 `(ok, detail)` 元组。"""
+    if isinstance(result, dict):
+        return bool(result.get("ok")), str(result.get("detail") or "")
+    if isinstance(result, (list, tuple)) and len(result) == 2:
+        return bool(result[0]), str(result[1])
+    return bool(result), ""
 
 
 # 兼容别名：`main.py` 通过 runtime.py 引用 GuardianRuntime，这里保留同名导出。

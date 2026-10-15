@@ -1,0 +1,44 @@
+{
+  "_comment": "Guardian 独立内核配置（B16 §9 M3）。挂到内核容器的 /AstrBot/data/guardian/kernel_config.json，并用 GUARDIAN_CONFIG_FILE 指向它。",
+  "_note": "这份配置属于**内核进程**；适配层（AstrBot 插件）的那份在 WebUI 里改。两边必须指向同一个 shared_dir，否则 IPC 会各找各的 socket。",
+
+  "enabled": true,
+  "mode": "server",
+  "profile": "normal",
+  "check_interval": 60,
+  "dry_run": true,
+
+  "containers": {
+    "astrbot": "astrbot",
+    "napcat": "napcat",
+    "managed": ["astrbot", "napcat"]
+  },
+
+  "kernel": {
+    "mode": "ipc",
+    "transport": "auto",
+    "socket_path": "/AstrBot/data/guardian/kernel.sock",
+    "shared_dir": "/AstrBot/data",
+    "heartbeat_interval": 30,
+    "heartbeat_timeout": 90,
+    "max_auto_reloads": 1,
+    "reload_cooldown": 600,
+    "reload_grace_sec": 90,
+    "reload_reset_sec": 300
+  },
+
+  "safety": {
+    "allowed_containers": ["astrbot", "napcat"],
+    "protected_containers": ["astrbot"],
+    "action_cooldown_sec": 600,
+    "max_actions_per_hour": 6,
+    "allow_self_restart": false,
+    "max_consecutive_failures": 3
+  },
+
+  "notify": {
+    "umo_list": [],
+    "min_severity": "warn",
+    "rate_limit_sec": 60
+  }
+}

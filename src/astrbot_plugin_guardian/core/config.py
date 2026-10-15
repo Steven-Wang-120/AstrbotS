@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import math
+import sys
 from typing import Any
 
 # --------------------------------------------------------------------------- #
@@ -160,6 +161,31 @@ DEFAULTS: dict[str, Any] = {
         "post_sleep_notify": True,
         "levels": DEFAULT_LEVELS,
     },
+    "kernel": {
+        # M2：inproc（同进程，M1 旧形态，回滚路径）| ipc（走 IPC）
+        "mode": "inproc",
+        # M2/D3-a：auto（unix 优先，平台不支持则 tcp）| unix | tcp
+        "transport": "auto",
+        "socket_path": "",          # 空 -> <共享卷>/guardian/kernel.sock
+        "tcp_host": "127.0.0.1",    # 只允许 loopback（B16 §11-2）
+        "tcp_port": 6198,
+        "token_file": "",           # 空 -> <共享卷>/guardian/kernel.token
+        "shared_dir": "",           # 空 -> 由两端各自按数据目录推断
+        "request_timeout": 10,      # 单次 IPC 调用超时（秒）
+        "heartbeat_interval": 30,   # 内核写心跳的间隔（秒）
+        "heartbeat_timeout": 90,    # 看门狗判定内核卡死的阈值（秒）
+        # D4-a+ 有界自修复阶梯（§12.3.5），四条硬约束 C1-C4
+        "max_auto_reloads": 1,      # C1 次数有界（用户要"一次"）
+        "reload_cooldown": 600,     # C2 冷却间隔（秒）
+        "reload_grace_sec": 90,     # Stage 3 宽限期（秒）
+        "reload_reset_sec": 300,    # C4 稳定多久后复位额度（秒）
+        "reload_request_path": "",  # 空 -> <共享卷>/guardian/kernel_reload_request.json
+        "health_path": "",          # 空 -> <共享卷>/guardian/kernel_health.json
+        "adapter_events_path": "",  # 空 -> <共享卷>/guardian/adapter_events.jsonl
+        "unreachable_notify_after": 90,  # L4：掉线多久后适配层主动告警（秒）
+        # M5/D2-b：内核直连 docker.sock 执行动作（false 则回到"经看门狗"）
+        "direct_actions": True,
+    },
     "llm_tools": {
         "enabled": True,
         "require_admin": True,
@@ -176,6 +202,32 @@ VALID_PROFILES = {"normal", "night", "maintenance", "aggressive"}
 VALID_LEVEL_ACTIONS = {"none", "notify", "arm_sleep", "force_sleep"}
 VALID_INJECT_MODES = {"extra_user_content", "system_prompt"}
 VALID_RELOGIN_METHODS = {"restart_container", "webui_quick_login", "disabled"}
+VALID_KERNEL_MODES = {"inproc", "ipc", "sidecar"}
+#: B00 §7 用 `sidecar` 描述 D1-a 的部署形态，B16 §9 用 `ipc` 描述适配层的连接方式。
+#: 两者指的是同一件事（"内核不在本进程里"），这里统一到 `ipc` 作为内部规范值，
+#: `sidecar` 作为等价别名保留——避免文档里写的值在配置里填不进去。
+KERNEL_MODE_ALIASES = {"sidecar": "ipc"}
+#: `auto` = D3-a 的"Unix socket 优先，TCP 回退"：校验时解析成具体值，
+#: 运行时永远不会看到 `auto`。
+VALID_KERNEL_TRANSPORTS = {"auto", "unix", "tcp"}
+#: 允许的内核 TCP 监听地址——内核绝不暴露到网络（B16 §11-2）
+KERNEL_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def unix_socket_supported() -> bool:
+    """当前解释器/平台是否支持 asyncio 的 Unix domain socket。
+
+    Windows 上 `socket.AF_UNIX` 可能存在，但 ProactorEventLoop 不支持
+    `asyncio.start_unix_server`，所以不能只看 `hasattr(socket, "AF_UNIX")`。
+    """
+    import asyncio
+    import socket
+    import sys as _sys
+    if not hasattr(socket, "AF_UNIX"):
+        return False
+    if _sys.platform == "win32":
+        return False
+    return hasattr(asyncio, "start_unix_server")
 VALID_SELF_RESTART = {"watchdog", "docker_api", "disabled"}
 
 # 档案位 -> 巡检间隔倍率（相对 check_interval）
@@ -355,6 +407,53 @@ class GuardianConfig:
         if int(safety.get("max_actions_per_hour") or 0) <= 0:
             issues.append("safety.max_actions_per_hour <= 0，回退 6")
             safety["max_actions_per_hour"] = 6
+
+        # kernel（B16 §6 / §12.3.5）
+        kern = raw["kernel"]
+        if kern.get("mode") not in VALID_KERNEL_MODES:
+            issues.append(
+                f"kernel.mode={kern.get('mode')!r} 非法，回退 inproc")
+            kern["mode"] = "inproc"
+        kern["mode"] = KERNEL_MODE_ALIASES.get(str(kern["mode"]), str(kern["mode"]))
+        if kern.get("transport") not in VALID_KERNEL_TRANSPORTS:
+            issues.append(
+                f"kernel.transport={kern.get('transport')!r} 非法，回退 auto")
+            kern["transport"] = "auto"
+        # auto = D3-a 的"unix 优先，tcp 回退"。这是默认行为，不算用户错误，
+        # 因此解析过程**不**产生 issue；只有用户**显式**要 unix 而平台给不了，
+        # 才必须告诉他（否则他会以为走的是 socket，实际是 TCP）。
+        if kern["transport"] == "auto":
+            kern["transport"] = "unix" if unix_socket_supported() else "tcp"
+        if kern["transport"] == "unix" and not unix_socket_supported():
+            issues.append(
+                f"当前平台（{sys.platform}）不支持 Unix domain socket，"
+                "kernel.transport 已自动降级为 tcp")
+            kern["transport"] = "tcp"
+        host = str(kern.get("tcp_host") or "").strip()
+        if host not in KERNEL_LOOPBACK_HOSTS:
+            issues.append(
+                f"kernel.tcp_host={host!r} 非 loopback，已强制回 127.0.0.1"
+                "（内核绝不暴露到网络，B16 §11-2）")
+            kern["tcp_host"] = "127.0.0.1"
+        bounded(kern, "tcp_port", 6198, 1, 65535)
+        bounded(kern, "request_timeout", 10, 1, 120)
+        bounded(kern, "heartbeat_interval", 30, 5, 3600)
+        bounded(kern, "heartbeat_timeout", 90, 10, 7200)
+        bounded(kern, "max_auto_reloads", 1, 0, 10)
+        bounded(kern, "reload_cooldown", 600, 0, 86400)
+        bounded(kern, "reload_grace_sec", 90, 0, 3600)
+        bounded(kern, "reload_reset_sec", 300, 0, 86400)
+        bounded(kern, "unreachable_notify_after", 90, 0, 3600)
+        if int(kern["heartbeat_timeout"]) <= int(kern["heartbeat_interval"]):
+            issues.append(
+                f"kernel.heartbeat_timeout({kern['heartbeat_timeout']}) 不大于 "
+                f"heartbeat_interval({kern['heartbeat_interval']})，"
+                "会把健康内核误判为卡死；已提升为 3 倍间隔")
+            kern["heartbeat_timeout"] = int(kern["heartbeat_interval"]) * 3
+        if kern["mode"] == "ipc" and int(kern["max_auto_reloads"]) == 0:
+            issues.append(
+                "kernel.mode=ipc 但 max_auto_reloads=0：内核不可用时不会尝试"
+                "任何自修复，将直接进入 kernel_degraded")
 
         # lifecycle
         lc = raw["lifecycle"]

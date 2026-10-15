@@ -64,6 +64,7 @@ HELP_TEXT = """== 守护系统 Guardian ==
 /guardian diagnose <目标|all>    诊断
 /guardian jobs                   查看下次任务计划
 /guardian safety                 查看安全自检结果
+/guardian reset                  复位内核自修复额度（管理员）
 /guardian help                   本帮助
 别名：/守护
 说明：本插件不会根据对话关键词触发任何动作；所有动作来自定时巡检、
@@ -142,7 +143,7 @@ class GuardianPlugin(Star):
     @filter.event_message_type(EventMessageType.ALL)
     async def observe_message(self, event: AstrMessageEvent):
         try:
-            self.runtime.note_event()
+            await self.runtime.note_event()
         except Exception:  # noqa: BLE001
             pass
 
@@ -169,12 +170,12 @@ class GuardianPlugin(Star):
         if sub in ("help", "?", "-h", "--help"):
             return HELP_TEXT
         if sub == "status":
-            return rt.status_text()
+            return await rt.status_text()
         if sub == "check":
             scope = args[1].lower() if len(args) > 1 else "all"
             return await llm_tools.run_check(rt, scope)
         if sub == "level":
-            return rt.lifecycle_text()
+            return await rt.lifecycle_text()
         if sub == "sleep":
             if not event.is_admin():
                 return "需要管理员权限。"
@@ -208,8 +209,10 @@ class GuardianPlugin(Star):
         if sub == "restart":
             if not event.is_admin():
                 return "需要管理员权限。"
+            allow = await rt.allowlist()
             if len(args) < 2:
-                return f"用法：/guardian restart <容器>。允许：{', '.join(rt.allowlist()) or '(白名单为空)'}"
+                return (f"用法：/guardian restart <容器>。"
+                        f"允许：{', '.join(allow) or '(白名单为空)'}")
             return await llm_tools.restart_container(
                 rt, args[1], reason="管理员手动重启", is_admin=True, confirm=True)
         if sub == "incidents":
@@ -219,17 +222,21 @@ class GuardianPlugin(Star):
                     limit = int(args[1])
                 except ValueError:
                     pass
-            return rt.incidents_text(limit)
+            return await rt.incidents_text(limit)
         if sub == "diagnose":
             target = args[1] if len(args) > 1 else "all"
-            return rt.diagnose(target)
+            return await rt.diagnose(target)
         if sub == "jobs":
-            return "下次任务计划：\n" + rt.jobs_text()
+            return "下次任务计划：\n" + await rt.jobs_text()
         if sub == "safety":
-            warns = rt.safety_warnings()
+            warns = await rt.safety_warnings()
             if not warns:
                 return "安全自检：无告警。"
             return "安全自检告警：\n" + "\n".join(f"  - {w}" for w in warns)
+        if sub == "reset":
+            if not event.is_admin():
+                return "需要管理员权限。"
+            return await rt.reset_kernel_health()
         return f"未知子命令 {sub}。\n{HELP_TEXT}"
 
     # ================================================================== #
@@ -245,7 +252,7 @@ class GuardianPlugin(Star):
         Args:
             scope(string): 检查范围，可选值：all（全部）、containers（容器）、qq（QQ 协议端）、ros2（ROS2）
         """
-        yield event.plain_result(llm_tools.health_report(self.runtime, scope))
+        yield event.plain_result(await llm_tools.health_report(self.runtime, scope))
 
     @filter.llm_tool()
     async def guardian_lifecycle_status(self, event: AstrMessageEvent):
@@ -253,7 +260,7 @@ class GuardianPlugin(Star):
 
         当用户问"你运行多久了""什么时候休息""睡眠机制"时调用。
         """
-        yield event.plain_result(llm_tools.lifecycle_status(self.runtime))
+        yield event.plain_result(await llm_tools.lifecycle_status(self.runtime))
 
     @filter.llm_tool()
     async def guardian_run_check(self, event: AstrMessageEvent, scope: str = "all"):
@@ -273,7 +280,7 @@ class GuardianPlugin(Star):
         Args:
             target(string): 目标名，例如容器名 astrbot/napcat，或 all 表示全部
         """
-        yield event.plain_result(llm_tools.diagnose(self.runtime, target))
+        yield event.plain_result(await llm_tools.diagnose(self.runtime, target))
 
     @filter.llm_tool()
     async def guardian_list_incidents(self, event: AstrMessageEvent, limit: float = 10):
@@ -284,7 +291,7 @@ class GuardianPlugin(Star):
         """
         # 不要在这里 int(limit)：LLM 可能传 Infinity/NaN，int(float('inf')) 抛
         # OverflowError。统一交给 llm_tools.safe_int 做有限性校验与夹取。
-        yield event.plain_result(llm_tools.list_incidents(self.runtime, limit))
+        yield event.plain_result(await llm_tools.list_incidents(self.runtime, limit))
 
     @filter.llm_tool()
     async def guardian_request_sleep(self, event: AstrMessageEvent, reason: str,
@@ -303,7 +310,7 @@ class GuardianPlugin(Star):
             duration_min(number): 期望离线时长（分钟），0-120，0 表示立即重启恢复
             confirm(boolean): 二次确认标志，true 才真正执行，默认 false
         """
-        armed = bool(self.runtime.engine.lifecycle_state.sleep_armed)
+        armed = await self.runtime.sleep_armed()
         text = await llm_tools.request_sleep(
             self.runtime, reason, duration_min,
             is_admin=event.is_admin(), armed=armed, confirm=confirm)
@@ -356,24 +363,15 @@ class GuardianPlugin(Star):
         """把生命周期引导提示词注入到 LLM 请求。
 
         注意：不使用 system_prompt（会破坏上游缓存），改用 extra_user_content_parts。
+        素材由内核一次性给出（`llm_injection`）——适配层不去读内核的
+        `state`/`config`，否则在 `kernel.mode=ipc` 下会直接违反 I2。
         """
         try:
-            rt = self.runtime
-            cfg = rt.config
-            blocks: list[str] = []
-            prompt = rt.state.get("lifecycle.inject_prompt")
-            if cfg.lifecycle.enabled and prompt:
-                level = rt.state.get("lifecycle.inject_level") or ""
-                blocks.append(
-                    f'<lifecycle_guard level="{level}">\n{prompt}\n'
-                    "（这是系统内部状态提示，请自然融入你的行为，不要逐字复述。）\n"
-                    "</lifecycle_guard>")
-            if cfg.llm_tools.inject_status_context:
-                blocks.append(llm_tools.build_status_context(rt))
-            if not blocks:
+            injection = await self.runtime.llm_injection()
+            text = str(injection.get("text") or "")
+            if not text:
                 return
-            text = "\n".join(blocks)
-            mode = cfg.lifecycle.inject_mode
+            mode = str(injection.get("mode") or "extra_user_content")
             if mode == "system_prompt":
                 req.system_prompt = (getattr(req, "system_prompt", "") or "") + "\n\n" + text
             else:
@@ -394,7 +392,7 @@ class GuardianPlugin(Star):
         name = getattr(tool, "name", "")
         if str(name).startswith("guardian_"):
             llm_tools.log_tool_call(str(name), tool_args if isinstance(tool_args, dict) else None)
-            self.runtime.audit.append(
+            await self.runtime.audit_append(
                 kind="llm.tool_call", target=str(name),
                 detail=str(tool_args)[:300], actor="llm", trigger="llm", ok=True)
 
@@ -403,6 +401,6 @@ class GuardianPlugin(Star):
                               tool_args: Any, tool_result: Any):
         name = getattr(tool, "name", "")
         if str(name).startswith("guardian_"):
-            self.runtime.audit.append(
+            await self.runtime.audit_append(
                 kind="llm.tool_result", target=str(name),
                 detail=str(tool_result)[:300], actor="llm", trigger="llm", ok=True)

@@ -95,7 +95,7 @@ async def main() -> int:
               f"{i.get('status','')} {str(i.get('message',''))[:70]}")
 
     print("\n--- 生命周期 ---")
-    print(rt.lifecycle_text())
+    print(await rt.lifecycle_text())
 
     print("\n--- 状态快照（节选） ---")
     snap = rt.state.snapshot() if hasattr(rt.state, "snapshot") else {}

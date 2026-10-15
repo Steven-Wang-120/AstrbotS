@@ -64,8 +64,8 @@ bash tests/run_all.sh
 
 ## 自检结果
 
-`tests/` 下共 5 个自检脚本 + 1 个看门狗脚本，覆盖核心逻辑、探针、插件装载、
-内核解耦、对抗性边界与看门狗：
+`tests/` 下共 6 个自检脚本 + 1 个看门狗脚本，覆盖核心逻辑、探针、插件装载、
+内核解耦、内核 IPC 契约、对抗性边界与看门狗：
 
 | 脚本 | 覆盖 |
 | --- | --- |
@@ -73,10 +73,35 @@ bash tests/run_all.sh
 | `test_probes_e2e.py` | 9 个探针 + 4 个动作 + 模式装配 + 通知器（使用 fixtures 假数据） |
 | `test_plugin_load.py` | 插件装载、命令/工具/钩子注册、提示词注入、硬上限睡眠、零关键词反证 |
 | `test_kernel_decoupling.py` | 内核侧模块不得 `import astrbot`（静态守卫 + 阻断 astrbot 的动态导入） |
+| `test_kernel_ipc.py` | **内核 IPC 契约**（B16 §10）：全 method 请求/响应/错误/超时/断连；断连必须显式失败；D4-a+ 自修复有界性 C1–C4；inproc 与 ipc 两后端结果一致性；独立内核进程（M3）验收 |
 | `test_adversarial.py` | **对抗性边界**：非法/自相矛盾输入、状态竞争、非有限数值、归因正确性 |
 | `test_watchdog.sh` | 看门狗放行 / 白名单拒绝 / 过期拒绝 / 畸形忽略 / 失败记录 |
 
 运行：`bash tests/run_all.sh`（Python 自检需要 `aiohttp`）
+
+---
+
+## 独立内核（B16）
+
+守护内核可以从 AstrBot 进程里搬出来独立运行，从而根治"重启 astrbot = 自杀"的
+自杀悖论（S1）。分阶段推进：M0 解耦 → M1 拆 kernel/adapter → **M2 IPC** →
+**M3 独立进程** → M4 看门狗心跳守护 → M5 动作直连化。
+
+已完成的 M2/M3 用法：
+
+```bash
+# 独立启动内核（无 AstrBot 依赖）
+python -m astrbot_plugin_guardian.kernel --selftest     # 冒烟：起→自 ping→跑一轮→退出
+python -m astrbot_plugin_guardian.kernel                # 常驻
+python -m astrbot_plugin_guardian.kernel --print-config # 看解析后的配置与归一化告警
+
+# 切换到独立内核：插件配置里把 kernel.mode 从 inproc 改成 ipc
+# 并让两边 kernel.shared_dir 指向同一个共享卷
+```
+
+`kernel.mode=inproc` 是默认值，也是**回滚路径**：行为与拆分前完全一致。
+生产部署见 [deploy/docker-compose.yml](deploy/docker-compose.yml) 的
+`guardian-kernel` 服务与 [deploy/kernel/](deploy/kernel/)。
 
 ---
 

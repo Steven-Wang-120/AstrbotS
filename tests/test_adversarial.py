@@ -800,13 +800,16 @@ def test_list_incidents_with_infinite_limit_is_handled():
     import astrbot_plugin_guardian.tools.llm_tools as lt
 
     class RT:
-        def incidents_text(self, limit):
+        async def incidents_text(self, limit):
             return f"limit={limit}"
 
-    assert lt.list_incidents(RT(), float("inf")) == "limit=10"
-    assert lt.list_incidents(RT(), float("nan")) == "limit=10"
-    assert lt.list_incidents(RT(), 999) == "limit=50"
-    assert lt.list_incidents(RT(), 0) == "limit=1"
+    async def main():
+        assert await lt.list_incidents(RT(), float("inf")) == "limit=10"
+        assert await lt.list_incidents(RT(), float("nan")) == "limit=10"
+        assert await lt.list_incidents(RT(), 999) == "limit=50"
+        assert await lt.list_incidents(RT(), 0) == "limit=1"
+
+    asyncio.run(main())
 
 
 def test_exec_run_timeout_maps_to_docker_unavailable():

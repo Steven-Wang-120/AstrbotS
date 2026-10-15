@@ -20,7 +20,7 @@ export PYTHON
 echo
 
 RC=0
-for t in test_core_logic.py test_probes_e2e.py test_plugin_load.py test_kernel_decoupling.py test_adversarial.py; do
+for t in test_core_logic.py test_probes_e2e.py test_plugin_load.py test_kernel_decoupling.py test_kernel_ipc.py test_adversarial.py; do
   echo "== $t =="
   "$PYTHON" "$HERE/$t" || RC=1
   echo
