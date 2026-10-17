@@ -109,6 +109,19 @@ class QqReloginAction(Action):
         steps: list[str] = []
         napcat_name = str(self.config.containers.napcat)
 
+        # ---- [1.5] 已在线短路 ------------------------------------------ #
+        # 手动 `/guardian login` 不经过探针判定，可能在 QQ 本来就正常时被触发。
+        # 此时若 `StartedAt` 已过宽限期，[2] 会把**健康的** napcat 重启一次 ——
+        # 纯属多余中断（真机 L10）。先复核一次 online，真在线就直接收工：
+        # 不重启、不发密码（符合 A1 / F6）。
+        online, vnote = await self._verify_online(attempts=1)
+        if online:
+            steps.append(f"预检复核在线：{vnote}")
+            await self._finalize_quick_login(steps)
+            await self._on_success()
+            await self._notify_ok(steps)
+            return self._result(True, "；".join(steps), started)
+
         # ---- [2] 有条件重启（全文件唯一的容器重启点，I6） --------------- #
         if method == "restart_container":
             # 被踢下线时客户端停在提示页、不会自己回到登录页，只有重启能把它推
