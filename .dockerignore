@@ -1,0 +1,33 @@
+# 仓库根即插件根，deploy/kernel/Dockerfile 会 `COPY . /app/src/astrbot_plugin_guardian`。
+# 这里剔除所有**不属于插件运行时**的东西：测试、部署、文档、VCS、虚拟环境、缓存、
+# 构建产物与仓库级资产。镜像里只需要插件源码 + metadata.yaml + requirements.txt。
+.git
+.gitignore
+.gitattributes
+.github
+.venv
+venv
+.ruff_cache
+.pytest_cache
+.mypy_cache
+.idea
+.vscode
+.workbuddy-ai
+
+tests
+deploy
+docs
+
+__pycache__
+**/__pycache__
+*.pyc
+*.pyo
+
+build_plugin_zip.py
+pyproject.toml
+README*.tmp
+*.docx
+*.log
+*.zip
+logo.png
+LICENSE
