@@ -111,8 +111,14 @@ class QqReloginAction(Action):
 
         # ---- [2] 有条件重启（全文件唯一的容器重启点，I6） --------------- #
         if method == "restart_container":
-            skip, note = await self._should_skip_restart(napcat_name)
+            # 被踢下线时客户端停在提示页、不会自己回到登录页，只有重启能把它推
+            # 过去。这种状态必须绕开宽限期，否则会白等一整个 `restart_grace_sec`
+            # （默认 1h）——真机 K-03 发现。
+            kicked, knote = await self._kicked_offline()
+            skip, note = await self._should_skip_restart(napcat_name, force=kicked)
             steps.append(note)
+            if kicked:
+                steps.append(f"检测到被踢下线：{knote}")
             if not skip:
                 try:
                     await self.docker.restart(napcat_name, timeout=15)
@@ -186,7 +192,29 @@ class QqReloginAction(Action):
     # ================================================================== #
     # [2] 有条件重启判据（B17 §4.2）
     # ================================================================== #
-    async def _should_skip_restart(self, name: str) -> tuple[bool, str]:
+    async def _kicked_offline(self) -> tuple[bool, str]:
+        """QQ 是否处于"被踢下线"状态（异地登录挤下线）。
+
+        被踢之后 NapCat 的 QQ 客户端停在"您的账号已在另一台终端登录"提示页，
+        **不会自己走到登录页**，所以 `qrcodeurl` 恒为空 —— 就绪判据永远不成立，
+        账密阶段根本进不去。唯一出路是重启容器把客户端推回登录页，因此这个状态
+        必须绕开 `restart_grace_sec`。
+
+        读不到状态时返回 False（保守）：宁可沿用宽限期，也不要在 NapCat 不可达
+        时凭空重启。
+        """
+        try:
+            status = await self.napcat.check_login_status()
+        except NapCatError as exc:
+            return False, str(exc)
+        err = str((status or {}).get("loginError") or "")
+        lowered = err.lower()
+        if "kickedoffline" in lowered or "下线通知" in err:
+            return True, err[:80]
+        return False, ""
+
+    async def _should_skip_restart(self, name: str, *,
+                                   force: bool = False) -> tuple[bool, str]:
         """容器启动距今 < `restart_grace_sec` 时跳过重启。
 
         为什么需要它：维护重启、睡眠唤醒、宿主机看门狗都会重启 napcat。若这些
@@ -194,9 +222,14 @@ class QqReloginAction(Action):
         就是纯粹的多余中断。**跳过重启不等于跳过动作**——[3][4][5] 照常执行，
         那正是补登录的地方。
 
+        `force=True` 用于"客户端被踢下线"这种非重启不可的状态：被踢后客户端停在
+        提示页、`qrcodeurl` 恒为空，就绪判据永远不成立，等宽限期毫无意义。
+
         判据直接读 Docker 事实，不复用任何新状态：任何缓存都会与"容器刚被别人
         重启过"这个外部事件失同步。解析失败按"需要重启"处理（保守）。
         """
+        if force:
+            return False, "客户端被踢下线，宽限期不适用，执行重启"
         grace = float(self.config.qq.restart_grace_sec or 0)
         if grace <= 0:
             return False, "restart_grace_sec=0，本轮强制重启"
