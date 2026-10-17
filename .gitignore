@@ -17,6 +17,7 @@ tests/_tmp/
 # ---- 开发文档与测试用例（不入库，仅本地保留）----
 /docs/
 /tests/
+/AstrBotS-Guardian-Handoff.docx
 
 # ---- 环境变量（仅保留 .env.example）----
 .env
