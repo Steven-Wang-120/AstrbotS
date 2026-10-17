@@ -88,9 +88,14 @@ systemctl status guardian-watchdog.timer
 
 | 键 | 说明 |
 | --- | --- |
-| `containers.managed` | 动作白名单，例如 `["astrbot", "napcat"]` |
+| `containers.astrbot` / `containers.napcat` | 本体 / 协议端**容器名**（Docker `container_name`，**不是** compose 服务名）。这是全部"目标名"的唯一来源 |
+| `containers.managed` | 动作白名单，填上面两个容器名，例如 `["astrbot-local", "napcat-local"]`；漏填会在启动日志里被点名告警 |
 | `qq.onebot_http_base` | 例如 `http://napcat:3000` |
 | `notify.umo_list` | 告警推送目标会话 UMO（可留空，仅记日志） |
+
+> `lifecycle.sleep_targets` / `uptime_targets` 默认用符号别名 `@self` / `@napcat`，会自动跟随
+> `containers.*`，**改名时不需要改这两项**。`safety.protected_containers` 只填**额外**要保护的
+> 容器——本体始终受保护，不用重复写。
 
 **首次部署建议**
 

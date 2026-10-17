@@ -476,6 +476,16 @@ class KernelIpcClient:
                 raise
             self._last_error = exc
 
+        # 留存原始错误：`connect()` 一旦成功就会把 `_last_error` 清成 `None`
+        # （见 `connect()` 末尾），而"不可自动重试"的破坏性方法必须把这个**带
+        # code / diagnostics** 的错误原样抛给调用方（B16 §12.3.1、不变量 I4）。
+        # 否则重连成功后的 `raise self._last_error` 会退化成 `raise None` →
+        # `TypeError: exceptions must derive from BaseException`，把可诊断的失败
+        # 伪装成看不懂的编程错误（2026-10-16 实机 C16-K11 发现）。
+        outage_error: IpcError = self._last_error or IpcError(
+            E_KERNEL_UNAVAILABLE, "内核连接中断",
+            diagnostics=self.diagnostics())
+
         # ---- Stage 1：静默重连（指数退避，合计 ~15.5s） ----
         await self._mark_outage()
         if await self._fast_reconnect():
@@ -486,7 +496,8 @@ class KernelIpcClient:
                 with contextlib.suppress(IpcError):
                     return await self._call_guarded(method, params, timeout=timeout)
             else:
-                raise self._last_error
+                raise self._recovered_not_retried(method, "Stage1 静默重连",
+                                                 outage_error)
 
         # ---- Stage 2：请求一次内核重载（受 C1/C2 闸门） ----
         granted, reason = self._request_reload()
@@ -501,10 +512,27 @@ class KernelIpcClient:
             if method not in NO_RETRY_METHODS:
                 with contextlib.suppress(IpcError):
                     return await self._call_guarded(method, params, timeout=timeout)
-            raise self._last_error
+            raise self._recovered_not_retried(method, "Stage3 内核重载",
+                                              outage_error)
 
         # ---- Stage 4：仍失败 → 判定自修复失败，显式失败 ----
         return await self._fail_degraded("重载后仍未恢复")
+
+    def _recovered_not_retried(self, method: str, how: str,
+                               original: IpcError) -> IpcError:
+        """通道已恢复，但**破坏性 method 不自动重试**（B16 §6.4）。
+
+        必须与"内核仍不可用"区分开：原样重放 `original`（例如 "内核拒绝连接"）
+        会让运维以为内核还挂着，而它其实已经回来了（2026-10-16 实机 C16-K11
+        观察到的误导）。保留原 `code` 以维持调用方的分支判断，只把文案换成
+        "已恢复、未重试、请重试"。
+        """
+        return IpcError(
+            original.code,
+            f"{how}已恢复，但 {method} 会产生真实副作用，不自动重试"
+            "（避免重复执行），请重新发起",
+            diagnostics=original.diagnostics,
+            self_healable=original.self_healable)
 
     async def _call_guarded(self, method: str, params: dict | None,
                             *, timeout: float | None) -> Any:

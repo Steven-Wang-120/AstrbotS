@@ -132,7 +132,9 @@ class SelfHealthProbe(Probe):
 
     @staticmethod
     def expand_targets(config, targets=None) -> list[str]:
-        return ["astrbot"]
+        # 用配置里的本体容器名，而不是写死 "astrbot" —— 否则用户改名后，
+        # 审计与报告里这个探针会一直挂着错的名字（B12 §容器名一致性）。
+        return [config.self_container]
 
     async def _check(self):
         import shutil

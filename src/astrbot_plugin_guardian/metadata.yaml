@@ -9,7 +9,7 @@ desc: >-
   在 30 天内真正"睡眠"（重启维护）至少一次。全部能力以 LLM 工具形式暴露给 Bot 自主调用，
   并由白名单、冷却、熔断、dry-run 四重安全约束保护。
 author: AstrbotS
-version: 0.2.0
+version: 0.5.0
 repo: "https://github.com/Steven-Wang-120/AstrbotS"
 astrbot_version: ">=4.5.7"
 support_platforms:

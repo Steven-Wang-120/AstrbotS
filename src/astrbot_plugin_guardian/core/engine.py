@@ -198,6 +198,16 @@ class HealthEngine:
                 status=finding.status, severity=finding.severity,
                 message=finding.reason, trigger=trigger)
 
+            # 主动睡眠窗口：目标是被我们自己故意睡下的，不是故障。
+            # 不动作、不推送，但**仍然记录**（I4：抑制要留痕，不能静默消失）。
+            sleeping = self.sleeping_targets()
+            if finding.target in sleeping:
+                inc.suppressed = True
+                inc.suppress_reason = "sleeping"
+                inc.severity = Severity.INFO
+                incidents.append(inc)
+                continue
+
             # 动作（maintenance 档位不动作）
             #
             # profile 必须**每轮重新读取**：本轮前面的动作可能刚因连续失败把档位
@@ -248,7 +258,11 @@ class HealthEngine:
         inc.result = result
         if not spec.params.get("_watchdog_committed"):
             degraded = self.safety.commit(spec, result.ok)
-            await self._note_degradation(degraded, trigger)
+            # 用 `spec.trigger`（由 `_handle_findings` 在调用前写入），
+            # 而不是裸 `trigger`——本方法没有该形参，此前会抛 NameError，
+            # 导致**任何**由巡检发现触发的动作在动作已执行之后崩溃：
+            # 动作真的做了，但 `action.execute` 审计与 `action.done` 事件双双丢失。
+            await self._note_degradation(degraded, spec.trigger)
         self.audit.append(
             kind="action.execute", target=spec.target,
             detail=f"{spec.kind} -> {result.detail}",
@@ -420,6 +434,49 @@ class HealthEngine:
         if len(self._incidents) > MAX_INCIDENTS_KEPT:
             self._incidents = self._incidents[-MAX_INCIDENTS_KEPT:]
         self.audit.append(incident=inc)
+
+    # ------------------------------------------------------------------ #
+    # 主动睡眠窗口（B15 生命周期睡眠 × 巡检互斥）
+    # ------------------------------------------------------------------ #
+    #: 睡眠窗口在 `wake_at` 之后自动失效的额外宽限（秒）：覆盖停止/启动/复核开销。
+    SLEEP_WINDOW_SLACK_SEC = 120.0
+
+    def mark_sleeping(self, targets, duration_min: int) -> None:
+        """把目标登记进"主动睡眠窗口"，让巡检不再把它当成故障。
+
+        2026-10-16 实机 C16-K3 发现的真问题：内核自己的巡检（`check_interval`）
+        会把**故意睡下**的容器读成 `exited`/CRIT，然后 `start_container` 把睡眠
+        打断——实测 60s 的睡眠在 ~24s 处被巡检唤醒；更糟的是，睡眠末尾的
+        `StartedAt` 复核是被**巡检的重启**喂过的，等于假阳性通过，直接架空了
+        M5/D2-b"内核亲眼看到自己动作生效"的核心主张。
+        """
+        window = dict(self.state.get("sleep.window") or {})
+        wake = (time.time() + max(0, int(duration_min)) * 60
+                + self.SLEEP_WINDOW_SLACK_SEC)
+        for target in targets:
+            window[str(target)] = wake
+        self.state.set("sleep.window", window)
+
+    def clear_sleeping(self, targets) -> None:
+        window = dict(self.state.get("sleep.window") or {})
+        for target in targets:
+            window.pop(str(target), None)
+        self.state.set("sleep.window", window or None)
+
+    def sleeping_targets(self, now: float | None = None) -> set[str]:
+        """仍在睡眠窗口内的目标集合（`wake_at` 过后自动失效，进程崩溃也安全）。"""
+        window = self.state.get("sleep.window")
+        if not isinstance(window, dict):
+            return set()
+        now = time.time() if now is None else now
+        out: set[str] = set()
+        for target, wake in window.items():
+            try:
+                if float(wake) > now:
+                    out.add(str(target))
+            except (TypeError, ValueError):
+                continue
+        return out
 
     def recent_incidents(self, limit: int = 10) -> list[Incident]:
         return list(reversed(self._incidents[-limit:]))

@@ -117,6 +117,9 @@ async def _reconcile_locked(engine) -> None:
     else:
         for target in pending["targets"]:
             engine.state.bump_fail_streak(target)
+    # 看门狗已给出终态 → 睡眠窗口可以撤了（否则巡检会继续把目标当成"在睡"，
+    # 从而漏掉真正的故障；窗口本身也有 `wake_at` 兜底过期）。
+    engine.clear_sleeping(pending["targets"])
     engine.state.set("watchdog.pending", None)
     await engine.state.flush(force=True)
     engine.audit.append(kind="watchdog.result", target=",".join(pending["targets"]),

@@ -69,21 +69,21 @@
     }
   },
   "containers": {
-    "description": "容器名配置",
+    "description": "容器名配置（填 Docker 容器名，即 container_name，不是 compose 服务名）",
     "type": "object",
     "items": {
       "astrbot": {
-        "description": "AstrBot 本体容器名",
+        "description": "AstrBot 本体容器名（container_name）。本体始终受保护，无需在别处重复",
         "type": "string",
         "default": "astrbot"
       },
       "napcat": {
-        "description": "NapCat 协议端容器名",
+        "description": "NapCat 协议端容器名（container_name）",
         "type": "string",
         "default": "napcat"
       },
       "managed": {
-        "description": "受管容器白名单（可被守护与重启）",
+        "description": "受管容器白名单（可被守护与重启）。需填容器名，漏填会导致所有自动动作被拒",
         "type": "list",
         "default": []
       }
@@ -159,6 +159,12 @@
         "type": "int",
         "default": 2,
         "hint": "用于抑制网络抖动误判"
+      },
+      "activity_evidence_sec": {
+        "description": "最近有消息事件即视为 QQ 在线的弱正据窗口（秒，0 = 关闭）",
+        "type": "int",
+        "default": 1800,
+        "hint": "在未开 OneBot 11 HTTP 的部署里，协议端活跃度是唯一可用的在线证据"
       },
       "request_timeout": {
         "description": "OneBot 请求超时（秒）",
@@ -239,7 +245,7 @@
         "default": "0 4 * * *"
       },
       "daily_restart_targets": {
-        "description": "定时重启目标（必须在白名单内）",
+        "description": "定时重启目标（必须在白名单内）。可用别名 @self / @napcat",
         "type": "list",
         "default": []
       }
@@ -333,14 +339,14 @@
     "type": "object",
     "items": {
       "allowed_containers": {
-        "description": "允许被动作作用的容器白名单",
+        "description": "允许被动作作用的容器白名单（填容器名；留空则所有自动重启被拒）",
         "type": "list",
         "default": []
       },
       "protected_containers": {
-        "description": "受保护容器（需 allow_self_restart 才可重启）",
+        "description": "额外受保护的容器（本体容器始终受保护，无需在此重复）",
         "type": "list",
-        "default": ["astrbot"]
+        "default": []
       },
       "action_cooldown_sec": {
         "description": "同一目标动作冷却（秒）",
@@ -408,14 +414,14 @@
         "default": true
       },
       "sleep_targets": {
-        "description": "睡眠（真重启）作用的容器",
+        "description": "睡眠（真重启）作用的容器。可用别名 @self（本体）/ @napcat（协议端），也可直接填容器名",
         "type": "list",
-        "default": ["astrbot", "napcat"]
+        "default": ["@self", "@napcat"]
       },
       "uptime_targets": {
-        "description": "用于计算运行时长的容器（取最早启动者）",
+        "description": "用于计算运行时长的容器（取最早启动者）。可用别名 @self / @napcat",
         "type": "list",
-        "default": ["astrbot", "napcat"]
+        "default": ["@self", "@napcat"]
       },
       "inject_mode": {
         "description": "提示词注入方式",
@@ -642,7 +648,14 @@
       "direct_actions": {
         "description": "内核直连 docker.sock 执行动作（M5；false 则回到「经看门狗」）",
         "type": "bool",
-        "default": true
+        "default": true,
+        "hint": "仅在 kernel.mode=ipc（内核独立进程）时生效；inproc 下自动走「经看门狗」"
+      },
+      "legacy_data_dir": {
+        "description": "旧数据目录（M4 迁移源；留空 = 由 shared_dir 推断 AstrBot 插件数据目录）",
+        "type": "string",
+        "default": "",
+        "hint": "迁移幂等、只复制不删除，旧目录保留为只读副本可回滚"
       }
     }
   },

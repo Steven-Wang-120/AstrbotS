@@ -149,7 +149,7 @@ class SafetyGuard:
             method = str(cfg.qq.relogin_method or "").strip()
             if method != "restart_container":
                 return []
-            napcat = str(cfg.containers.get("napcat") or "").strip()
+            napcat = str(cfg.napcat_container or "").strip()
             return [napcat] if napcat else []
         if action.kind in LOGICAL_TARGET_KINDS:
             return []

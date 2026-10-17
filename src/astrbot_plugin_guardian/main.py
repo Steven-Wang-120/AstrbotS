@@ -50,7 +50,7 @@ except ImportError:  # pragma: no cover
 PLUGIN_NAME = "astrbot_plugin_guardian"
 PLUGIN_DESC = "守护系统：服务器/ROS2 双模式健康守护（容器自愈 / QQ 重登 / 内存防护 / 自主睡眠）"
 PLUGIN_AUTHOR = "AstrbotS"
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.5.0"
 
 HELP_TEXT = """== 守护系统 Guardian ==
 /guardian status                 健康快照（含运行时长与生命周期等级）

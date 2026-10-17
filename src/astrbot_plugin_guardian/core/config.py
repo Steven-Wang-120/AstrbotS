@@ -83,6 +83,9 @@ DEFAULTS: dict[str, Any] = {
         "cli_path": "docker",
         "timeout": 10,
     },
+    # 容器名（Docker `container_name`，**不是** compose 服务名）。
+    # 这里是全部"目标名"的唯一事实来源：下面的 `@self` / `@napcat` 别名、
+    # 本体保护判定、巡检/内存探针都从这两个值派生（B12 §容器名一致性）。
     "containers": {
         "astrbot": "astrbot",
         "napcat": "napcat",
@@ -102,6 +105,10 @@ DEFAULTS: dict[str, Any] = {
         "max_relogin_per_hour": 4,
         "offline_confirm_rounds": 2,
         "request_timeout": 8,
+        # F11：把"最近有消息事件"作为 QQ 在线的**弱正据**。在本部署（NapCat
+        # 未开 OneBot 11 HTTP）里，协议端活跃度是唯一真正可用的证据链；窗口内
+        # 有消息 = 协议端活着。设为 0 关闭该证据链。
+        "activity_evidence_sec": 1800,
     },
     "memory": {
         "warn_mb": 700,
@@ -139,7 +146,10 @@ DEFAULTS: dict[str, Any] = {
     },
     "safety": {
         "allowed_containers": [],
-        "protected_containers": ["astrbot"],
+        # 只列**额外**受保护的容器。本体容器（`containers.astrbot`）由
+        # `is_protected()` 无条件保护，不依赖这个列表——所以改名时忘了同步这里，
+        # 也不会让本体失去保护（B12 §容器名一致性）。
+        "protected_containers": [],
         "action_cooldown_sec": 600,
         "max_actions_per_hour": 6,
         "circuit_breaker_window_sec": 1800,
@@ -153,8 +163,11 @@ DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "max_uptime_hours": 720,
         "force_sleep_on_deadline": True,
-        "sleep_targets": ["astrbot", "napcat"],
-        "uptime_targets": ["astrbot", "napcat"],
+        # `@self` / `@napcat` 是**符号别名**，分别解析为 `containers.astrbot` /
+        # `containers.napcat`。用户只需在前端填一次容器名，改名时这两个列表不必跟着改
+        # （B12 §容器名一致性）。直接写真实容器名同样有效。
+        "sleep_targets": ["@self", "@napcat"],
+        "uptime_targets": ["@self", "@napcat"],
         "inject_mode": "extra_user_content",
         "inject_cooldown_sec": 900,
         "sleep_duration_min": 0,
@@ -185,6 +198,9 @@ DEFAULTS: dict[str, Any] = {
         "unreachable_notify_after": 90,  # L4：掉线多久后适配层主动告警（秒）
         # M5/D2-b：内核直连 docker.sock 执行动作（false 则回到"经看门狗"）
         "direct_actions": True,
+        # M4：旧数据目录（AstrBot 插件数据目录）。空 -> 由 shared_dir 推断；
+        # 再空则不迁移。迁移幂等、只复制不删除（B16 §7）。
+        "legacy_data_dir": "",
     },
     "llm_tools": {
         "enabled": True,
@@ -229,6 +245,13 @@ def unix_socket_supported() -> bool:
         return False
     return hasattr(asyncio, "start_unix_server")
 VALID_SELF_RESTART = {"watchdog", "docker_api", "disabled"}
+
+#: 目标列表里可用的**符号别名**。用户只在前端填一次容器名，所有策略列表引用槽位，
+#: 改名时不必到处同步（B12 §容器名一致性）。未识别的值按真实容器名原样保留。
+TARGET_ALIASES: dict[str, str] = {
+    "@self": "astrbot",     # -> containers.astrbot（本体容器）
+    "@napcat": "napcat",    # -> containers.napcat（协议端容器）
+}
 
 # 档案位 -> 巡检间隔倍率（相对 check_interval）
 PROFILE_INTERVAL_FACTOR = {
@@ -298,32 +321,74 @@ class GuardianConfig:
         self._d = _to_attr(self.raw)
 
     # -- 派生属性 ---------------------------------------------------------- #
+    def _names(self, section: str, key: str) -> list[str]:
+        """从某个配置段取字符串列表；段被写成非对象时按空处理（validate 永不抛）。"""
+        block = self.raw.get(section)
+        listed = block.get(key) if isinstance(block, dict) else None
+        return [str(x) for x in (listed or [])]
+
     @property
     def action_allowlist(self) -> set[str]:
         """允许被动作作用的容器白名单（managed ∪ allowed_containers）。"""
-        managed = list(self.raw.get("containers", {}).get("managed") or [])
-        allowed = list(self.raw.get("safety", {}).get("allowed_containers") or [])
-        return {str(x).strip() for x in (managed + allowed) if str(x).strip()}
+        managed = self._names("containers", "managed")
+        allowed = self._names("safety", "allowed_containers")
+        return {x.strip() for x in (managed + allowed) if x.strip()}
+
+    @property
+    def self_container(self) -> str:
+        """本体容器名（`containers.astrbot`）。全部"本体"语义的唯一取值处。"""
+        return self._container_name("astrbot")
+
+    @property
+    def napcat_container(self) -> str:
+        """协议端容器名（`containers.napcat`）。"""
+        return self._container_name("napcat")
+
+    def _container_name(self, key: str) -> str:
+        block = self.raw.get("containers")
+        if not isinstance(block, dict):
+            return key
+        return str(block.get(key) or key)
+
+    def resolve_targets(self, targets) -> list[str]:
+        """把目标列表里的符号别名解析成真实容器名（去重、保序、丢空值）。
+
+        `@self` -> `containers.astrbot`，`@napcat` -> `containers.napcat`；
+        其它值按真实容器名原样保留，所以老配置里写死的名字继续可用。
+        """
+        mapping = {"@self": self.self_container, "@napcat": self.napcat_container}
+        out: list[str] = []
+        for item in targets or []:
+            name = mapping.get(str(item).strip(), str(item).strip())
+            if name and name not in out:
+                out.append(name)
+        return out
 
     @property
     def protected_containers(self) -> set[str]:
-        return {str(x).strip() for x in (self.raw["safety"]["protected_containers"] or [])}
+        """**额外**受保护的容器（本体容器不在此列，见 `is_protected()`）。"""
+        safety = self.raw.get("safety")
+        listed = safety.get("protected_containers") if isinstance(safety, dict) else None
+        return {str(x).strip() for x in (listed or []) if str(x).strip()}
 
     @property
     def all_containers(self) -> list[str]:
-        c = self.raw["containers"]
-        out = [c.get("astrbot", "astrbot"), c.get("napcat", "napcat")]
-        return [x for x in dict.fromkeys(out) if x]
+        return list(dict.fromkeys([self.self_container, self.napcat_container]))
 
     @property
     def issues(self) -> list[str]:
         return list(self._issues)
 
     def is_self(self, target: str) -> bool:
-        return target == self.raw["containers"].get("astrbot")
+        return target == self.self_container
 
     def is_protected(self, target: str) -> bool:
-        return target in self.protected_containers
+        """本体容器**永远**受保护，与 `protected_containers` 配置无关。
+
+        这样即使用户改了容器名却忘了同步 `protected_containers`，本体也不会
+        悄悄失去保护（B12 §容器名一致性）——把"靠配置正确"变成"结构上不可能错"。
+        """
+        return target == self.self_container or target in self.protected_containers
 
     def profile_interval(self, profile: str | None = None) -> int:
         """按当前档位计算巡检间隔（秒）；0 表示暂停巡检。"""
@@ -381,6 +446,7 @@ class GuardianConfig:
 
         bounded(qq, "request_timeout", 8, 1, 30)
         bounded(qq, "offline_confirm_rounds", 2, 1, 100)
+        bounded(qq, "activity_evidence_sec", 1800, 0, 86400)
         memory = raw["memory"]
         bounded(memory, "sample_interval", 300, 1, 3600)
         bounded(memory, "samples", 10, 5, 200)
@@ -407,6 +473,16 @@ class GuardianConfig:
         if int(safety.get("max_actions_per_hour") or 0) <= 0:
             issues.append("safety.max_actions_per_hour <= 0，回退 6")
             safety["max_actions_per_hour"] = 6
+
+        # 旧版本的 `protected_containers` 默认值是写死的 ["astrbot"]。用户改了本体容器名
+        # 之后，那个字面量既不是本体、也不是任何真实容器，纯属历史残留 → 视为未配置。
+        # 注意：这**不会**削弱本体的保护（`is_protected()` 已无条件保护本体）。
+        if (list(safety.get("protected_containers") or []) == ["astrbot"]
+                and self.self_container != "astrbot"):
+            safety["protected_containers"] = []
+            issues.append(
+                "safety.protected_containers 仍是旧默认值 ['astrbot']，已视为空"
+                f"（本体容器 {self.self_container} 始终受保护，无需在此重复）")
 
         # kernel（B16 §6 / §12.3.5）
         kern = raw["kernel"]
@@ -454,6 +530,10 @@ class GuardianConfig:
             issues.append(
                 "kernel.mode=ipc 但 max_auto_reloads=0：内核不可用时不会尝试"
                 "任何自修复，将直接进入 kernel_degraded")
+        # M5/D2-b：`direct_actions` 是否**真正生效**由 mode 决定（同进程内核直连
+        # 重启 astrbot = 自杀 S1）。这里不做归一化——默认组合 inproc+true 是合法的
+        # "尚未迁移"状态，不该刷 issue；生效判定放在动作层 `direct_actions_enabled()`。
+        kern["legacy_data_dir"] = str(kern.get("legacy_data_dir") or "").strip()
 
         # lifecycle
         lc = raw["lifecycle"]
@@ -524,7 +604,8 @@ class GuardianConfig:
             issues.append("lifecycle.sleep_duration_min 非法，回退 0")
 
         allow = self.action_allowlist
-        sleep_targets = [str(x) for x in (lc.get("sleep_targets") or [])]
+        # `@self` / `@napcat` 在这里解析成真实容器名；之后全流程只见真实名字。
+        sleep_targets = self.resolve_targets(lc.get("sleep_targets"))
         bad = [t for t in sleep_targets if t not in allow]
         if bad:
             issues.append(
@@ -534,26 +615,42 @@ class GuardianConfig:
         lc["sleep_targets"] = sleep_targets
         if not sleep_targets:
             issues.append("lifecycle.sleep_targets 为空，睡眠功能不可用（仅告警）")
-        elif (self.is_self(self.raw["containers"].get("astrbot", "astrbot"))
-              and not safety.get("allow_self_restart")):
-            self_container = self.raw["containers"].get("astrbot", "astrbot")
-            if self_container in sleep_targets:
+        elif self.is_self(self.self_container) and not safety.get("allow_self_restart"):
+            if self.self_container in sleep_targets:
                 issues.append(
-                    f"sleep_targets 含本体容器 {self_container} 但 "
+                    f"sleep_targets 含本体容器 {self.self_container} 但 "
                     "safety.allow_self_restart=false，睡眠时会自动跳过本体"
                     "（仅睡眠其他目标）。如需本体参与睡眠，请开启 "
                     "allow_self_restart 并部署看门狗。")
 
-        up_targets = [str(x) for x in (lc.get("uptime_targets") or [])]
+        up_targets = self.resolve_targets(lc.get("uptime_targets"))
         if not up_targets:
             up_targets = self.all_containers
             issues.append("lifecycle.uptime_targets 为空，回退为全部容器")
         lc["uptime_targets"] = up_targets
 
+        # 定时重启目标同样支持 `@self` / `@napcat`（`schedule` 可能被用户写成非对象，
+        # 这里只做防御性取值，不新增崩溃点——validate() 承诺永不抛异常）。
+        sched = raw.get("schedule")
+        if isinstance(sched, dict):
+            sched["daily_restart_targets"] = self.resolve_targets(
+                sched.get("daily_restart_targets"))
+
         if not allow:
             issues.append(
                 "动作白名单为空（containers.managed / safety.allowed_containers 均为空），"
-                "所有自动重启将被拒绝")
+                f"所有自动重启将被拒绝；本部署需要放行的容器是 {self.all_containers}，"
+                "请把它们填入 containers.managed 或 safety.allowed_containers")
+        else:
+            # 白名单非空、但漏了本部署实际要守护的容器 —— 点名说清楚，别让用户
+            # 只看到一条"某个动作被拒绝"的运行时日志（B12 §容器名一致性）。
+            missing = [name for name in self.all_containers if name not in allow]
+            if missing:
+                issues.append(
+                    f"动作白名单未包含容器 {missing}（本部署的容器名来自 "
+                    "containers.astrbot / containers.napcat）；这些容器上的自动重启"
+                    "与睡眠会被拒绝。如非有意，请把它们加入 containers.managed "
+                    "或 safety.allowed_containers")
 
         self._issues = issues
         self._d = _to_attr(self.raw)

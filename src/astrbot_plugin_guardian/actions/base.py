@@ -43,3 +43,21 @@ def get_action(kind: str) -> Type[Action] | None:
 
 def all_action_kinds() -> list[str]:
     return sorted(_REGISTRY)
+
+
+def direct_actions_enabled(config) -> bool:
+    """M5/D2-b：内核能否**直连** docker.sock 执行动作。
+
+    两个条件同时满足才为真：
+
+    1. `kernel.direct_actions` 为真（显式回滚开关，B16 §9 M5）；
+    2. `kernel.mode == "ipc"`——只有内核真的独立成进程时，直连重启 `astrbot` 才
+       不再是自杀（B16 §1 S1）。`inproc` 下"内核"就住在 `astrbot` 进程里，
+       直连等于自杀，必须回退"经看门狗"。
+    """
+    kernel = getattr(config, "kernel", None)
+    if kernel is None:
+        return False
+    enabled = bool(getattr(kernel, "direct_actions", True))
+    mode = str(getattr(kernel, "mode", "inproc") or "inproc")
+    return enabled and mode == "ipc"

@@ -258,8 +258,9 @@ class GuardianAdapter:
     # ================================================================== #
     # 统一调用入口（两种后端共用）
     # ================================================================== #
-    async def _call(self, method: str, params: dict | None = None) -> Any:
-        return await self._backend.call(method, params)
+    async def _call(self, method: str, params: dict | None = None,
+                    *, timeout: float | None = None) -> Any:
+        return await self._backend.call(method, params, timeout=timeout)
 
     # ================================================================== #
     # 有副作用能力
@@ -267,19 +268,32 @@ class GuardianAdapter:
     async def run_check(self, scope: str = "all") -> dict[str, Any]:
         return await self._call("run_check", {"scope": scope})
 
+    #: 容器停止/启动是**秒级**动作（`docker stop -t N` 的 HTTP 往返 ≥ N 秒），
+    #: 默认 10s 请求超时会把它误判成"内核无响应"。给足余量。
+    CONTAINER_ACTION_TIMEOUT = 90.0
+
     async def request_restart(self, container: str, **kw) -> tuple[bool, str]:
-        return _unpair(await self._call("restart_container",
-                                        {"container": container, **kw}))
+        return _unpair(await self._call(
+            "restart_container", {"container": container, **kw},
+            timeout=self.CONTAINER_ACTION_TIMEOUT))
 
     async def request_start(self, container: str, **kw) -> tuple[bool, str]:
-        return _unpair(await self._call("start_container",
-                                        {"container": container, **kw}))
+        return _unpair(await self._call(
+            "start_container", {"container": container, **kw},
+            timeout=self.CONTAINER_ACTION_TIMEOUT))
 
     async def request_sleep(self, reason: str, duration_min: int = 0,
                             **kw) -> tuple[bool, str]:
+        # 真睡眠是**分钟级**长任务：内核会一直阻塞到 stop → 等待 → start →
+        # 复核 `StartedAt` 全部完成，所以一次 IPC 往返 ≈ duration_min*60 秒。
+        # 用默认 10s 请求超时必然超时，会把"睡眠成功"报成"内核无响应"
+        # （2026-10-16 实机 C16-K3）。按睡眠时长放大，另加 60s 余量给
+        # 停止/启动/复核本身。
+        wait = max(0, int(duration_min)) * 60 + 60
         return _unpair(await self._call(
             "request_sleep",
-            {"reason": reason, "duration_min": duration_min, **kw}))
+            {"reason": reason, "duration_min": duration_min, **kw},
+            timeout=wait))
 
     async def set_mode(self, mode: str) -> tuple[bool, str]:
         return _unpair(await self._call("set_mode", {"mode": mode}))

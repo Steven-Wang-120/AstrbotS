@@ -83,6 +83,19 @@ class QqLoginProbe(Probe):
             who = metrics["nickname"] or metrics["user_id"] or "已连接账号"
             return self.result(Status.OK, Severity.INFO, f"QQ 在线（{who}）", metrics)
         if online is None:
+            # F11：把"最近有消息事件"作为**弱正据**。协议端能持续把消息推上来，
+            # 本身就证明它活着。这是本部署（NapCat 未开 OneBot 11 HTTP）里唯一
+            # 真正可用的证据链——此前算了却不用，导致探测能力为 0。
+            window = float(getattr(cfg, "activity_evidence_sec", 1800) or 0)
+            age = self._activity_age()
+            metrics["evidence_activity_age"] = age
+            if window > 0 and age is not None and 0 <= age <= window:
+                self.state.set("qq_fail_streak", 0)
+                metrics["activity_evidence"] = True
+                return self.result(
+                    Status.OK, Severity.INFO,
+                    f"QQ 在线（最近 {age / 60:.0f} 分钟内有消息事件，弱正据；"
+                    "协议端活跃度）", metrics)
             self.state.set("qq_fail_streak", 0)
             metrics["detection_degraded"] = True
             return self.result(Status.UNKNOWN, Severity.WARN,
@@ -98,3 +111,22 @@ class QqLoginProbe(Probe):
                                f"QQ 疑似掉线（{streak}/{need} 轮确认中）", metrics)
         return self.result(Status.CRIT, Severity.CRIT,
                            f"QQ 已掉线（连续 {streak} 轮确认）", metrics)
+
+    def _activity_age(self) -> float | None:
+        """最近一次消息事件的年龄（秒）。
+
+        由 `GuardianKernel.note_event()` / `_patrol()` 写入 `last_event_age`。
+        从未收到过事件时返回 None——**不把"没数据"当成"没活跃"**。
+        """
+        if self.state is None:
+            return None
+        raw = self.state.get("last_event_age")
+        if raw is None:
+            return None
+        try:
+            age = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if age != age or age < 0:  # NaN 或负值（时钟回拨）→ 不可用
+            return None
+        return age

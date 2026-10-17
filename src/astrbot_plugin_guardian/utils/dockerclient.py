@@ -67,11 +67,15 @@ class DockerClient:
     async def _request(self, method: str, path: str, *,
                        params: dict | None = None,
                        payload: Any = None,
-                       raw: bool = False) -> Any:
+                       raw: bool = False,
+                       timeout: float | None = None) -> Any:
         session = await self._ensure_session()
         url = f"http://localhost/{self.api_version}{path}"
         try:
-            async with session.request(method, url, params=params, json=payload) as resp:
+            async with session.request(
+                method, url, params=params, json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout or self.timeout),
+            ) as resp:
                 body = await resp.read()
                 if resp.status >= 400:
                     text = body.decode("utf-8", "replace")[:400]
@@ -86,10 +90,27 @@ class DockerClient:
                     return json.loads(body.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError):
                     return {"_raw": body.decode("utf-8", "replace")}
+        except asyncio.TimeoutError as exc:
+            # 请求超时 **不等于** daemon 不可达：请求已经发出、daemon 正在处理
+            # （或这次操作很慢），结果未知。必须归到 DockerError（daemon 有应答、
+            # 这次操作失败），否则调用方的降级分支会误判成"docker 访问失效"。
+            # 2026-10-16 实机 C16-K3 发现：`docker stop -t 10` 的 HTTP 往返必然
+            # ≥10s，撞上客户端 10s 总超时 → 被判成 DockerUnavailable →
+            # `_execute_direct` 走 `unreachable` 分支，**跳过恢复与 `StartedAt`
+            # 复核**，D2-b 的"亲眼看到"完全失效。注意要排在 aiohttp.ClientError
+            # 之前：aiohttp 的 ServerTimeoutError 同时是 ClientError 子类。
+            raise DockerError(
+                f"Docker 请求超时（{timeout or self.timeout:.0f}s）: {method} {path}"
+                "（daemon 已收到请求，本次操作结果未知）") from exc
         except aiohttp.ClientError as exc:
             raise DockerUnavailable(f"Docker 不可达({self.socket_path}): {exc}") from exc
-        except asyncio.TimeoutError as exc:
-            raise DockerUnavailable(f"Docker 请求超时: {method} {path}") from exc
+        except NotImplementedError as exc:
+            # Windows 的 ProactorEventLoop 不支持 UnixConnector（连接期抛
+            # NotImplementedError，不是 aiohttp.ClientError）。不翻译会让它击穿
+            # "所有 Docker 失败都是 DockerUnavailable/DockerError"的契约，
+            # 使调用方的降级分支失效（例如内核直连动作回退看门狗）。
+            raise DockerUnavailable(
+                f"当前平台不支持 Unix socket 连接（{self.socket_path}）") from exc
 
     # ------------------------------------------------------------------ #
     async def ping(self) -> bool:
@@ -138,15 +159,19 @@ class DockerClient:
         return await self._request("GET", f"/containers/{name}/json")
 
     async def restart(self, name: str, timeout: int = 10) -> None:
+        # `t` 是 daemon 的优雅停止宽限期（SIGTERM → 等待 → SIGKILL），HTTP 往返
+        # 必然 ≥ 该值；客户端总超时必须显著大于它，否则每次重启/停止都会撞超时。
         await self._request("POST", f"/containers/{name}/restart",
-                            params={"t": str(int(timeout))})
+                            params={"t": str(int(timeout))},
+                            timeout=int(timeout) + 20)
 
     async def start(self, name: str) -> None:
         await self._request("POST", f"/containers/{name}/start")
 
     async def stop(self, name: str, timeout: int = 10) -> None:
         await self._request("POST", f"/containers/{name}/stop",
-                            params={"t": str(int(timeout))})
+                            params={"t": str(int(timeout))},
+                            timeout=int(timeout) + 20)
 
     async def stats(self, name: str) -> dict[str, Any]:
         return await self._request("GET", f"/containers/{name}/stats",
@@ -178,14 +203,16 @@ class DockerClient:
                 if resp.status >= 400:
                     raise DockerError(f"exec start -> {resp.status}", resp.status)
         except asyncio.TimeoutError as exc:
-            # aiohttp 的总超时抛的是 asyncio.TimeoutError（3.11+ 即内置 TimeoutError），
-            # 它不是 aiohttp.ClientError 的子类；不单独捕获会让原始 TimeoutError
-            # 击穿"所有 Docker 失败都是 DockerUnavailable/DockerError"的契约，
-            # 使调用方（Ros2Runner / 探针）的降级分支失效。
-            raise DockerUnavailable(
+            # 与 `_request` 同一条判据：exec 超时说明 daemon 可达、命令跑太久，
+            # 不是"不可达"。归到 DockerError，调用方（ros2_runner）会给出
+            # "exec 失败/超时"而不是"Docker 不可达"。
+            raise DockerError(
                 f"exec 超时({timeout or self.timeout}s): {' '.join(cmd[:3])}") from exc
         except aiohttp.ClientError as exc:
             raise DockerUnavailable(f"exec 不可达: {exc}") from exc
+        except NotImplementedError as exc:
+            raise DockerUnavailable(
+                f"当前平台不支持 Unix socket 连接（{self.socket_path}）") from exc
         text = _demux(body)
         info = await self._request("GET", f"/exec/{exec_id}/json")
         return int(info.get("ExitCode") or 0), text

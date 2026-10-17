@@ -37,6 +37,7 @@ from .core.scheduler import Scheduler
 from .core.state import StateStore
 from .notify.notifier import Notifier
 from .utils.dockerclient import DockerClient
+from .utils.migration import migrate_legacy_data, resolve_legacy_data_dir
 from .utils.napcat import NapCatClient
 from .utils.ros2_runner import Ros2Runner
 from .utils.textutil import fmt_ts
@@ -44,7 +45,7 @@ from .utils.textutil import fmt_ts
 PLUGIN_NAME = "astrbot_plugin_guardian"
 
 #: 内核版本（随 IPC `ping` / `kernel_ready` 事件回传，便于两端版本对齐排查）
-KERNEL_VERSION = "0.3.0"
+KERNEL_VERSION = "0.5.0"
 
 #: 内核默认数据目录（域 A 自己的数据目录，B16 §7）。
 #: 适配层可以覆盖（传入 AstrBot 规范目录），独立进程则可用环境变量指定。
@@ -77,6 +78,12 @@ class GuardianKernel:
         self._sender = sender
         self._action_caller = action_caller
 
+        # 数据目录迁移（B16 §7 / §9 M4）：内核独立后，业务状态要从 AstrBot 的插件
+        # 数据目录搬到内核可见的共享卷。幂等、只复制不删除、留 `.migrated` 标记。
+        # 必须**先于** StateStore/AuditLog 构造，否则会先读到空状态。
+        self.migration = migrate_legacy_data(
+            self.data_dir, resolve_legacy_data_dir(self.config, self.data_dir))
+
         self.state = StateStore(self.data_dir)
         self.state.load()
         # 配置中的 mode/profile 作为初始值（运行时可覆盖并持久化）
@@ -85,6 +92,17 @@ class GuardianKernel:
 
         self.audit = AuditLog(self.data_dir)
         self.bus = EventBus()
+
+        if self.migration.get("migrated"):
+            detail = (f"数据目录迁移：{self.migration['reason']}，"
+                      f"已复制 {', '.join(self.migration['copied'])}")
+            logger.info(f"[guardian] {detail}（源目录保留为只读副本，可回滚）")
+            self.audit.append(kind="data.migrated", detail=detail, ok=True)
+        elif str(self.migration.get("reason", "")).startswith("io-error"):
+            logger.warning(
+                f"[guardian] 数据目录迁移失败（不阻断启动）：{self.migration['reason']}")
+            self.audit.append(kind="data.migrate_failed",
+                              detail=str(self.migration.get("reason")), ok=False)
 
         self.docker = DockerClient(
             socket_path=self.config.docker.socket_path,
@@ -150,6 +168,8 @@ class GuardianKernel:
         logger.info(
             f"[guardian] 守护系统已启动 | 模式={self.state.get('mode')} "
             f"档位={self.state.get('profile')} dry_run={self.config.dry_run} "
+            f"kernel.mode={self.config.kernel.mode} "
+            f"direct_actions={self.direct_actions} "
             f"数据目录={self.data_dir}")
         for w in self._safety_warnings:
             logger.warning(f"[guardian] 启动告警：{w}")
@@ -333,7 +353,14 @@ class GuardianKernel:
             "lifecycle_enabled": bool(self.config.lifecycle.enabled),
             "require_admin": bool(self.config.llm_tools.require_admin),
             "sleep_targets": list(self.config.lifecycle.sleep_targets or []),
+            "direct_actions": bool(self.direct_actions),
         }
+
+    @property
+    def direct_actions(self) -> bool:
+        """M5/D2-b：本内核是否直连 docker.sock 执行动作（生效值，非配置原值）。"""
+        from .actions.base import direct_actions_enabled
+        return direct_actions_enabled(self.config)
 
     def sleep_armed(self) -> bool:
         return bool(self.engine.lifecycle_state.sleep_armed)
