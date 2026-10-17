@@ -38,7 +38,7 @@ from .core.state import StateStore
 from .notify.notifier import Notifier
 from .utils.dockerclient import DockerClient
 from .utils.migration import migrate_legacy_data, resolve_legacy_data_dir
-from .utils.napcat import NapCatClient
+from .utils.napcat import NapCatClient, NapCatError
 from .utils.ros2_runner import Ros2Runner
 from .utils.textutil import fmt_ts
 
@@ -119,6 +119,8 @@ class GuardianKernel:
             webui_token=self.config.qq.webui_token or self.config.qq.access_token,
             action_caller=(self._call_onebot
                            if self.config.qq.transport == "reverse_ws" else None),
+            # B17 §6.3：`webui_quick_login` 需要账号才能打 `SetQuickLogin`
+            account=self.config.qq.account,
         )
         self.ros2 = Ros2Runner(self.config, self.docker)
 
@@ -286,6 +288,46 @@ class GuardianKernel:
         spec = ActionSpec(kind="start_container", target=container,
                           actor=actor, trigger=trigger)
         return await self._dispatch(spec)
+
+    async def request_qq_login(self, *, actor: str = "command",
+                               trigger: str = "command",
+                               reason: str = "") -> tuple[bool, str]:
+        """触发一次 QQ 登录恢复阶梯（B17 §8.1）。
+
+        `target="qq"` 是**逻辑目标**：`safety._physical_targets` 会按
+        `qq.relogin_method` 把它映射到 napcat 容器，冷却/归属判定沿用 B12。
+        """
+        spec = ActionSpec(kind="qq_relogin", target="qq", actor=actor,
+                          trigger=trigger,
+                          reason=reason or "手动触发 QQ 登录恢复")
+        return await self._dispatch(spec)
+
+    async def qq_login_status(self) -> dict[str, Any]:
+        """登录状态页的数据源（只读，B17 §10.3）。
+
+        刻意做成内核方法而不是"适配层自己读 state"：I1 规定状态只由内核写，
+        `kernel.mode=ipc` 下适配层根本没有那份 state。这里只暴露判定结论，
+        **不**暴露任何凭据字段。
+        """
+        status: dict[str, Any] = {
+            "isLogin": None, "isOffline": None, "qrcodeurl": "",
+            "loginError": "", "available": False,
+            "last_failure": self.state.get("qq.last_failure") or {},
+            "auth_hold_until": float(self.state.get("qq.auth_hold_until") or 0),
+            "last_success_at": float(self.state.get("qq.last_success_at") or 0),
+            "webui_public_base": str(self.config.qq.webui_public_base or ""),
+            "webui_base": str(self.config.qq.webui_base or ""),
+            "account": str(self.config.qq.account or ""),
+            "relogin_method": str(self.config.qq.relogin_method or ""),
+            "has_credential": bool(self.config.qq.account and self.config.qq.password),
+            "now": time.time(),
+        }
+        try:
+            status.update(await self.napcat.check_login_status())
+            status["available"] = True
+        except NapCatError as exc:
+            status["loginError"] = str(exc)
+        return status
 
     async def request_sleep(self, reason: str, duration_min: int = 0, *,
                             actor: str = "llm", trigger: str = "llm",

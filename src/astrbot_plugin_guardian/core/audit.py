@@ -18,7 +18,10 @@ from typing import Any
 
 from .log import logger
 
-SENSITIVE_KEYS = {"access_token", "token", "webui_token", "authorization", "password", "secret"}
+#: B17 §12.2：即使设计上不写凭据，也做兜底脱敏。`password_md5` / `credential`
+#: 是账密登录新增的两类敏感字段——它们比密码本身更容易被"顺手"写进 detail。
+SENSITIVE_KEYS = {"access_token", "token", "webui_token", "authorization",
+                  "password", "password_md5", "secret", "credential"}
 MAX_BYTES = 8 * 1024 * 1024  # 8MB 轮转
 KEEP_ROTATIONS = 3
 

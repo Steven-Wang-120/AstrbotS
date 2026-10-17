@@ -38,6 +38,11 @@ PERSISTED_KEYS = {
     "tripped_at",
     "last_status",        # key -> status value（跃迁告警基线）
     "qq_fail_streak",
+    # B17 §13：登录恢复的状态必须跨重启保留。否则插件重载一次就丢掉静默期，
+    # 密码试错保护形同虚设；WebUI 登录状态页也会看不到"最近一次失败原因"。
+    "qq.auth_hold_until",
+    "qq.last_failure",
+    "qq.last_success_at",
     "samples",            # container -> [[ts, mb], ...]
     "memory.sample_meta", # 实例/口径标识与连续确认，随样本一起持久化
     "watchdog.pending",   # 宿主机任务 nonce/目标，提交不等于睡眠完成

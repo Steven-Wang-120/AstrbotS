@@ -48,15 +48,17 @@ except ImportError:  # pragma: no cover
     llm_tools = importlib.import_module(f"{_pkg}.tools.llm_tools")
 
 PLUGIN_NAME = "astrbot_plugin_guardian"
-PLUGIN_DESC = "守护系统：服务器/ROS2 双模式健康守护（容器自愈 / QQ 重登 / 内存防护 / 自主睡眠）"
+PLUGIN_DESC = "守护系统：服务器/ROS2 双模式健康守护（容器自愈 / QQ 账密登录恢复 / 内存防护 / 自主睡眠）"
 PLUGIN_AUTHOR = "AstrbotS"
-PLUGIN_VERSION = "0.5.0"
+PLUGIN_VERSION = "0.6.0"
 
 HELP_TEXT = """== 守护系统 Guardian ==
 /guardian status                 健康快照（含运行时长与生命周期等级）
 /guardian check [all|containers|qq|ros2]   立即巡检
 /guardian level                  生命周期等级详情
 /guardian sleep [分钟] [原因]    立即执行一次真睡眠（管理员）
+/guardian login                  立即执行一次登录恢复（管理员）
+/guardian webui                  NapCat WebUI 直达链接（免输 token）
 /guardian mode <server|ros2>     切换守护模式
 /guardian profile <normal|night|maintenance|aggressive>  切换档位
 /guardian restart <容器>         重启容器（管理员）
@@ -108,6 +110,34 @@ class GuardianPlugin(Star):
             self._started = True
         except Exception as exc:  # noqa: BLE001
             logger.error(f"[guardian] 启动失败: {exc}", exc_info=True)
+        self._register_webapi()
+
+    def _register_webapi(self) -> None:
+        """注册 WebUI 登录状态页（B17 §10.2）。
+
+        `register_web_api` 是 AstrBot 4.5.7+ 才有的能力，且签名/返回值在不同
+        版本上可能不同——所以整块 try/except，失败就降级为落盘静态页（§10.3），
+        绝不让"页面注册失败"把插件启动带崩（风险 R3）。
+        """
+        try:
+            from .webapi import login_page
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[guardian] 无法加载登录状态页模块: {exc}")
+            return
+        try:
+            if login_page.register(self.context, self.runtime):
+                logger.info("[guardian] 登录状态页已注册：/api/plug/"
+                            f"{login_page.ROUTE_LOGIN}")
+                return
+            logger.info("[guardian] 当前 AstrBot 不支持 register_web_api，登录状态页降级落盘")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[guardian] 登录状态页注册失败（降级落盘）: {exc}")
+        try:
+            path = login_page.write_fallback(self.runtime)
+            if path:
+                logger.warning(f"[guardian] 登录状态页已写入宿主机可见路径: {path}")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[guardian] 登录状态页落盘失败: {exc}")
 
     @filter.on_plugin_loaded()
     async def on_plugin_loaded(self, metadata: Any = None):
@@ -126,6 +156,8 @@ class GuardianPlugin(Star):
             if not self._started:
                 await self.runtime.start()
                 self._started = True
+            # 重载路径同样要保证状态页在（register_web_api 对同路由是替换语义）。
+            self._register_webapi()
         except Exception as exc:  # noqa: BLE001
             logger.error(f"[guardian] 启动失败: {exc}", exc_info=True)
 
@@ -194,6 +226,22 @@ class GuardianPlugin(Star):
                 reason, duration, actor="command", trigger="command",
                 bypass_confirm=True)
             return f"睡眠{'已执行' if ok else '未执行'}：{detail}"
+        if sub == "login":
+            if not event.is_admin():
+                return "需要管理员权限。"
+            ok, detail = await rt.request_qq_login("管理员手动触发登录恢复")
+            return f"登录恢复{'成功' if ok else '未成功'}：{detail}"
+        if sub == "webui":
+            # ⚠️ 回执里带 webui token = token 进了 QQ 聊天记录。B17 §9.3 允许
+            # 这个行为，但**只对管理员**放开：把协议端凭据发给群里任何人都等于
+            # 交出 NapCat 控制台（与 /guardian restart 同级权限，故同级鉴权）。
+            if not event.is_admin():
+                return "需要管理员权限。"
+            # 审计只记 kind，**不记该文本**（B17 §9.3）。
+            await rt.audit_append(kind="qq.webui_link", target="qq",
+                                  detail="管理员查看 NapCat WebUI 直达链接",
+                                  actor="command", trigger="command", ok=True)
+            return rt.webui_links()
         if sub == "mode":
             if not event.is_admin():
                 return "需要管理员权限。"

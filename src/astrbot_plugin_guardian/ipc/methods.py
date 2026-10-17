@@ -173,6 +173,17 @@ def build_handlers(kernel: Any) -> dict[str, Handler]:
             trigger=_as_str(p.get("trigger"), "llm", limit=32) or "llm",
             reason=_as_str(p.get("reason"), f"重启 {name}", limit=200)))
 
+    async def h_request_qq_login(p: dict) -> dict:
+        """B17 §8.2：QQ 登录恢复阶梯。"""
+        return _pair(await kernel.request_qq_login(
+            actor=_as_str(p.get("actor"), "command", limit=32) or "command",
+            trigger=_as_str(p.get("trigger"), "command", limit=32) or "command",
+            reason=_as_str(p.get("reason"), "", limit=200)))
+
+    async def h_qq_login_status(p: dict) -> dict:
+        """B17 §10.3：登录状态页读取的只读透传（不含任何凭据字段）。"""
+        return _jsonable(await kernel.qq_login_status())
+
     async def h_start_container(p: dict) -> dict:
         name = _as_str(p.get("container"), "", limit=128)
         if not name:
@@ -227,6 +238,8 @@ def build_handlers(kernel: Any) -> dict[str, Handler]:
         "run_check": h_run_check,
         "request_sleep": h_request_sleep,
         "restart_container": h_restart_container,
+        "request_qq_login": h_request_qq_login,
+        "qq_login_status": h_qq_login_status,
         "start_container": h_start_container,
         "set_mode": h_set_mode,
         "set_profile": h_set_profile,
@@ -250,6 +263,7 @@ METHOD_NAMES = frozenset({
     "jobs_text", "safety_warnings", "allowlist", "diagnose", "list_incidents",
     "level_prompt", "injection", "status_context", "runtime_flags",
     "sleep_armed", "run_check", "request_sleep", "restart_container",
+    "request_qq_login", "qq_login_status",
     "start_container", "set_mode", "set_profile", "note_event",
     "audit_append", "ping",
 })
@@ -257,6 +271,7 @@ METHOD_NAMES = frozenset({
 #: 会产生真实副作用的 method（服务端超时后**不得重试**，避免重复执行）
 MUTATING_METHODS = frozenset({
     "run_check", "request_sleep", "restart_container", "start_container",
+    "request_qq_login",
     "set_mode", "set_profile", "note_event", "audit_append",
 })
 

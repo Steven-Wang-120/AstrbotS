@@ -100,6 +100,18 @@ DEFAULTS: dict[str, Any] = {
         "access_token": "",
         "webui_base": "",
         "webui_token": "",
+        # B17 §5.1：浏览器侧地址（只用于拼直达链接，绝不参与 API 调用）
+        "webui_public_base": "",
+        # B17 §5.1：账密登录凭据。`account` 为空即退化为 v0.5.0（只重启不登录）。
+        # `password` 填 32 位小写 hex 视为 md5 直接使用；否则按明文在内存里求 md5。
+        "account": "",
+        "password": "",
+        # B17 §5.2：`password_is_md5` 是**派生键**，不写 schema，只在运行时视图里存在。
+        "password_is_md5": False,
+        "restart_grace_sec": 3600,
+        "login_ready_timeout": 90,
+        "login_retry_interval": 3,
+        "password_fail_hold_sec": 21600,
         "relogin_method": "restart_container",
         "relogin_cooldown": 300,
         "max_relogin_per_hour": 4,
@@ -217,7 +229,10 @@ VALID_MODES = {"server", "ros2"}
 VALID_PROFILES = {"normal", "night", "maintenance", "aggressive"}
 VALID_LEVEL_ACTIONS = {"none", "notify", "arm_sleep", "force_sleep"}
 VALID_INJECT_MODES = {"extra_user_content", "system_prompt"}
-VALID_RELOGIN_METHODS = {"restart_container", "webui_quick_login", "disabled"}
+VALID_RELOGIN_METHODS = {"restart_container", "login_only", "disabled"}
+#: B17 §5.3：`webui_quick_login` 是历史值，代码实际打的 `/api/QQLogin/QuickLogin`
+#: 在 NapCat 4.18.14 上是 404，策略形同虚设。归一化时迁移为 `login_only` 并记 issue。
+RELOGIN_METHOD_ALIASES = {"webui_quick_login": "login_only"}
 VALID_KERNEL_MODES = {"inproc", "ipc", "sidecar"}
 #: B00 §7 用 `sidecar` 描述 D1-a 的部署形态，B16 §9 用 `ipc` 描述适配层的连接方式。
 #: 两者指的是同一件事（"内核不在本进程里"），这里统一到 `ipc` 作为内部规范值，
@@ -292,6 +307,17 @@ def deep_merge(base: dict, override: dict) -> dict:
         else:
             out[key] = copy.deepcopy(val)
     return out
+
+
+def _is_md5_hex(value: str) -> bool:
+    """32 位小写 hex 视为"用户已提供 md5"（B17 §5.1）。
+
+    只认**小写**：大写 hex 仍按明文处理，避免同一份密码在两种大小写下产生
+    两个不同的 md5 解释；这条规则由 `password_is_md5` 显式呈现，不做静默转换。
+    """
+    if len(value) != 32:
+        return False
+    return all(ch in "0123456789abcdef" for ch in value)
 
 
 # --------------------------------------------------------------------------- #
@@ -424,9 +450,42 @@ class GuardianConfig:
         if int(qq.get("check_interval") or 0) < 30:
             issues.append("qq.check_interval 过小，回退 1200")
             qq["check_interval"] = 1200
+
+        # B17 §5.3：历史值先迁移再校验，否则老配置会被"非法值回退"覆盖成默认值，
+        # 用户看不到"其实是改名了"这一层信息。
+        alias = RELOGIN_METHOD_ALIASES.get(str(qq.get("relogin_method") or "").strip())
+        if alias:
+            issues.append(
+                f"qq.relogin_method=webui_quick_login 已更名 {alias}，自动迁移"
+                "（原策略调用的 /api/QQLogin/QuickLogin 在 NapCat 4.18 上返回 404）")
+            qq["relogin_method"] = alias
         if qq.get("relogin_method") not in VALID_RELOGIN_METHODS:
             issues.append(f"qq.relogin_method={qq.get('relogin_method')!r} 非法，回退 restart_container")
             qq["relogin_method"] = "restart_container"
+
+        # B17 §5.2：账密登录凭据。账号非法一律清空（宁可退回"只重启"，也不拿
+        # 一个畸形账号去反复试错锁号）。
+        acc = str(qq.get("account") or "").strip()
+        if acc and not (acc.isdigit() and 5 <= len(acc) <= 12):
+            issues.append("qq.account 非纯数字或长度异常，已清空")
+            acc = ""
+        qq["account"] = acc
+
+        pwd = str(qq.get("password") or "")
+        qq["password"] = pwd
+        qq["password_is_md5"] = bool(pwd) and _is_md5_hex(pwd)
+        if pwd and not qq["password_is_md5"] and len(pwd) > 64:
+            issues.append("qq.password 超过 64 字符，已清空")
+            qq["password"] = ""
+            qq["password_is_md5"] = False
+        if pwd and acc and not qq["password"]:
+            issues.append("qq.password 已清空，账密阶段将被跳过")
+
+        public = str(qq.get("webui_public_base") or "").strip().rstrip("/")
+        if public and not public.startswith(("http://", "https://")):
+            issues.append("qq.webui_public_base 必须以 http(s):// 开头，已清空")
+            public = ""
+        qq["webui_public_base"] = public
 
         if qq.get("transport") not in {"reverse_ws", "http"}:
             issues.append("qq.transport 非法，回退 reverse_ws")
@@ -447,6 +506,30 @@ class GuardianConfig:
         bounded(qq, "request_timeout", 8, 1, 30)
         bounded(qq, "offline_confirm_rounds", 2, 1, 100)
         bounded(qq, "activity_evidence_sec", 1800, 0, 86400)
+
+        # B17 §5.2：登录阶梯的时间参数用**钳制**而非"回退默认值"——
+        # 用户把超时填大/填小是明确的意图，把它夹到边界比丢掉意图更符合预期
+        # （C17 T-01：restart_grace_sec=-5 → 0，login_ready_timeout=99999 → 600）。
+        def clamped(section, key, default, low, high):
+            value = section.get(key, default)
+            try:
+                parsed = float(value)
+            except (TypeError, ValueError):
+                parsed = None
+            if parsed is None or not math.isfinite(parsed):
+                issues.append(f"qq.{key}={value!r} 非法，回退 {default}")
+                section[key] = default
+                return
+            fixed = min(max(int(parsed), low), high)
+            if fixed != int(parsed):
+                issues.append(f"qq.{key}={int(parsed)} 超出 [{low}, {high}]，已钳制为 {fixed}")
+            section[key] = fixed
+
+        clamped(qq, "restart_grace_sec", 3600, 0, 86400)
+        clamped(qq, "login_ready_timeout", 90, 10, 600)
+        clamped(qq, "login_retry_interval", 3, 1, 30)
+        clamped(qq, "password_fail_hold_sec", 21600, 600, 604800)
+
         memory = raw["memory"]
         bounded(memory, "sample_interval", 300, 1, 3600)
         bounded(memory, "samples", 10, 5, 200)

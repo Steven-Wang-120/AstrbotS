@@ -9,7 +9,7 @@
 
 ```
 AstrbotS/
-├── docs/          B00–B16 开发/施工文档；C00–C16 测试文档
+├── docs/          B00–B17 开发/施工文档；C00–C17 测试文档；D00–D02 实机验收/缺陷报告
 ├── src/astrbot_plugin_guardian/   插件源码（直接放进 AstrBot 的 data/plugins/）
 ├── deploy/        docker-compose.yml + 看门狗（systemd 单元/定时器/脚本）+ 内核镜像
 └── tests/         自检测试（无需 AstrBot 即可运行）
@@ -21,8 +21,10 @@ AstrbotS/
 2. `docs/B15_生命周期等级与自主睡眠机制.md` —— 核心机制（等级 + 自主睡眠 + 30 天保证）
 3. `docs/B16_独立内核服务架构.md` —— 三域分离（内核/适配/看门狗）与 M0–M5 迁移（**已完成**）
 4. `docs/B01` → `B14` —— 按模块的施工细节
-5. `docs/C00` → `C16` —— 测试用例与验收判据（C13 为极端/故障注入，C16 为独立内核专项，含真机验收记录）
-6. `src/astrbot_plugin_guardian/README.md` —— 安装与配置速查
+5. `docs/C00` → `C17` —— 测试用例与验收判据（C13 为极端/故障注入，C16 为独立内核专项，C17 为账密登录恢复专项）
+6. `docs/B17` —— **QQ 账密登录恢复阶梯**（v0.6.0）：会话失效时的无人值守恢复、失败分级、离线可观测
+7. `docs/D02` —— **B17 真机验收报告**：K-01..K-10 结果、环境阻塞根因、缺陷 F22–F25
+8. `src/astrbot_plugin_guardian/README.md` —— 安装与配置速查
 
 ---
 
@@ -77,6 +79,7 @@ bash tests/run_all.sh
 | `test_kernel_ipc.py` | **内核 IPC 契约**（B16 §10）：全 method 请求/响应/错误/超时/断连；断连必须显式失败；D4-a+ 自修复有界性 C1–C4；inproc 与 ipc 两后端结果一致性；独立内核进程（M3）验收；**+ 重连后破坏性方法不重试、长任务超时放大** | 40 |
 | `test_kernel_guard.py` | **M4/M5 专项**：数据目录迁移幂等/非覆盖/可回滚、`direct_actions` 生效判定、`StartedAt`+健康复核（含 `starting` 过渡态）、直连睡眠清 `forced_at`、docker 失效回退看门狗 | 17 |
 | `test_adversarial.py` | **对抗性边界**：非法/自相矛盾输入、状态竞争、非有限数值、归因正确性；**+ 巡检动作全链路、睡眠窗口闸门、改名后本体仍受保护** | 77 |
+| `test_qq_login_recovery.py` | **账密登录恢复专项**（C17 §3 T-01..T-15）：配置归一化/别名迁移、Credential 缓存与 401 单次重换、`PasswordLogin` 四类解析（`code==0` 非成功）、有条件重启判据、失败不追加重启、静默期（含**失败即强制落盘**）、就绪等待、闭环写回、凭据零泄漏、dry-run 零副作用、通知不误拉黑、IPC 契约、域边界 | 63 |
 | `test_watchdog.sh`（`test_watchdog.py`） | 看门狗放行 / 白名单拒绝 / 过期拒绝 / 畸形忽略 / 失败记录 + **内核心跳守护**（心跳超时重启、reload 请求单一重启路径、冷却、非阻塞锁） | 75 |
 
 运行：`bash tests/run_all.sh`（Python 自检需要 `aiohttp`）

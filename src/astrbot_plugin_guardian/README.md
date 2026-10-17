@@ -97,6 +97,35 @@ systemctl status guardian-watchdog.timer
 > `containers.*`，**改名时不需要改这两项**。`safety.protected_containers` 只填**额外**要保护的
 > 容器——本体始终受保护，不用重复写。
 
+**账密登录恢复（B17，v0.6.0 起）**
+
+QQ 掉线后如果会话已过期，`restart_container` 重启多少次都回不来。填下面四项即可让插件
+在"重启 → 等待就绪 → 账密登录 → 复核写回"的阶梯里自动补登录（见 `docs/B17`）。
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `qq.account` | `""` | QQ 号（纯数字 5–12 位）。**留空即退化为 v0.5.0 行为**：只重启，不登录 |
+| `qq.password` | `""` | 密码。**建议填 32 位小写 md5**；填明文会以明文形式保存在 AstrBot 配置 JSON 中 |
+| `qq.webui_public_base` | `""` | 浏览器侧地址（如 `http://127.0.0.1:6099`），只用于生成直达链接 |
+| `qq.restart_grace_sec` | `3600` | 容器启动距今小于该值时跳过重启，避免维护重启后重复中断 |
+
+其余调优键：`qq.login_ready_timeout`（90s，等 QQ 到登录页）、`qq.login_retry_interval`
+（3s，轮询间隔）、`qq.password_fail_hold_sec`（21600s，密码失败后的静默期，防试错锁号）。
+
+`qq.relogin_method` 取值语义（v0.6.0 变更）：
+
+| 值 | 行为 |
+| --- | --- |
+| `restart_container`（默认） | 有条件重启 + 完整登录恢复阶梯 |
+| `login_only` | 不动容器，只做"等就绪 → 账密登录 → 复核写回" |
+| `webui_quick_login` | **已更名**，加载时自动迁移为 `login_only` 并告警（旧实现打的是 404 路由） |
+| `disabled` | 只告警 |
+
+> 登录失败分三类：密码错（`qq.login_failed`）、需验证码（`qq.login_captcha`）、需新设备验证
+> （`qq.login_new_device`）。三类都**不会**再追加重启，且失败后 6 小时内不再尝试账密。
+> QQ 离线时插件**不发 QQ 通知**（发了必失败，还会把管理员 UMO 拉黑），改走
+> `/api/plug/astrbot_plugin_guardian/login` 登录状态页 + 落盘 `guardian/last_login_error.txt`。
+
 **首次部署建议**
 
 1. 保持 `dry_run: true`（默认）观察若干天，日志中会出现 `[dry-run] 将...`。
@@ -130,6 +159,8 @@ systemctl status guardian-watchdog.timer
 /guardian check [scope]          # 立即巡检
 /guardian level                  # 生命周期详情
 /guardian sleep [分钟] [原因]    # 立即真睡眠（管理员）
+/guardian login                  # 立即执行一次登录恢复（管理员）
+/guardian webui                  # NapCat WebUI 直达链接（管理员，含 token）
 /guardian mode <server|ros2>     # 切换模式（管理员）
 /guardian profile <p>            # 切换档位（管理员）
 /guardian restart <容器>         # 重启容器（管理员）

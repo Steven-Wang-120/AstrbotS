@@ -137,11 +137,51 @@
         "type": "string",
         "default": ""
       },
+      "webui_public_base": {
+        "description": "浏览器侧 NapCat WebUI 地址",
+        "type": "string",
+        "default": "",
+        "hint": "如 http://127.0.0.1:6099。仅用于生成直达链接，不参与 API 调用"
+      },
+      "account": {
+        "description": "QQ 号（账密登录用）",
+        "type": "string",
+        "default": "",
+        "hint": "纯数字，5–12 位。留空则跳过账密阶段，行为退回 v0.5.0（仅重启）"
+      },
+      "password": {
+        "description": "QQ 密码（或 32 位小写 md5）",
+        "type": "string",
+        "default": "",
+        "hint": "建议直接填 md5；填明文会以明文形式保存在 AstrBot 配置文件中"
+      },
+      "restart_grace_sec": {
+        "description": "容器启动距今小于该值时跳过重启（秒）",
+        "type": "int",
+        "default": 3600,
+        "hint": "避免维护重启/睡眠唤醒后重复中断；0 表示每次都重启"
+      },
+      "login_ready_timeout": {
+        "description": "等待 QQ 到登录页的上限（秒）",
+        "type": "int",
+        "default": 90
+      },
+      "login_retry_interval": {
+        "description": "登录就绪轮询间隔（秒）",
+        "type": "int",
+        "default": 3
+      },
+      "password_fail_hold_sec": {
+        "description": "密码失败后的静默期（秒）",
+        "type": "int",
+        "default": 21600,
+        "hint": "期间不再尝试账密登录，防止反复试错锁号"
+      },
       "relogin_method": {
         "description": "掉线重登方式",
         "type": "string",
-        "options": ["restart_container", "webui_quick_login", "disabled"],
-        "labels": ["重启 NapCat 容器（推荐）", "调用 WebUI 快速登录", "仅告警不动作"],
+        "options": ["restart_container", "login_only", "disabled"],
+        "labels": ["有条件重启 + 登录恢复阶梯（推荐）", "不动容器，只做登录恢复", "仅告警不动作"],
         "default": "restart_container"
       },
       "relogin_cooldown": {

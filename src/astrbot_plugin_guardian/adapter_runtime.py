@@ -282,6 +282,40 @@ class GuardianAdapter:
             "start_container", {"container": container, **kw},
             timeout=self.CONTAINER_ACTION_TIMEOUT))
 
+    #: 登录恢复阶梯是**分钟级**长任务：有条件重启(≤15s) + 就绪等待(≤90s)
+    #: + 账密登录(≤30s) + 三轮复核(≈9s)。用默认 10s 超时必然把"正在登录"
+    #: 报成"内核无响应"（同 request_sleep 的教训）。
+    QQ_LOGIN_TIMEOUT = 240.0
+
+    async def request_qq_login(self, reason: str = "") -> tuple[bool, str]:
+        """透传给内核执行一次登录恢复阶梯（B17 §8.3）。"""
+        return _unpair(await self._call(
+            "request_qq_login",
+            {"reason": reason, "actor": "command", "trigger": "command"},
+            timeout=self.QQ_LOGIN_TIMEOUT))
+
+    async def qq_login_status(self) -> dict[str, Any]:
+        """登录状态页数据（只读，经内核取，适配层不自己读 state）。"""
+        return dict(await self._call("qq_login_status") or {})
+
+    def webui_links(self) -> str:
+        """NapCat WebUI 与登录状态页的直达链接（B17 §9.3）。
+
+        ⚠️ token 会出现在命令回执里 = 出现在 QQ 聊天记录里。这是用户显式请求
+        `/guardian webui` 的行为；审计里只记 `kind=qq.webui_link`，**不记该文本**。
+        """
+        cfg = self._cfg_view.qq
+        public = str(cfg.webui_public_base or "").rstrip("/")
+        token = str(cfg.webui_token or "")
+        if not public:
+            return ("未配置 qq.webui_public_base，无法生成浏览器侧链接。"
+                    "（容器内地址 qq.webui_base 只对插件自身可用）")
+        lines = [f"NapCat WebUI：{public}/webui?token={token}" if token else
+                 f"NapCat WebUI：{public}/webui"]
+        lines.append("登录状态页：<AstrBot 地址>/api/plug/astrbot_plugin_guardian/login")
+        lines.append("（登录状态页走 dashboard 鉴权，需要在浏览器里已登录 AstrBot WebUI）")
+        return "\n".join(lines)
+
     async def request_sleep(self, reason: str, duration_min: int = 0,
                             **kw) -> tuple[bool, str]:
         # 真睡眠是**分钟级**长任务：内核会一直阻塞到 stop → 等待 → start →

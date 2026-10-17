@@ -43,8 +43,14 @@ class Notifier:
         return f"{target}|{status}|{truncate(text, 60)}"
 
     async def push(self, text: str, *, severity: Severity = Severity.INFO,
-                   force: bool = False, target: str = "", status: str = "") -> bool:
-        """推送一条消息。force=True 时绕过档位静默与去重（用于睡眠等关键回执）。"""
+                   force: bool = False, target: str = "", status: str = "",
+                   count_failure: bool = True) -> bool:
+        """推送一条消息。force=True 时绕过档位静默与去重（用于睡眠等关键回执）。
+
+        `count_failure=False` 是 B17 §11.1 新增的 transient 语义：登录类通知失败
+        **不计入** UMO 拉黑计数。理由很直白——登录故障期间推送大概率失败，若照旧
+        累计 3 次就把管理员拉黑，等 QQ 恢复后连"已恢复"都收不到（缺陷 P4）。
+        """
         if not force:
             if not self._allowed_by_profile(severity):
                 logger.debug(f"[guardian] 通知被档位静默: {truncate(text, 40)}")
@@ -75,13 +81,14 @@ class Notifier:
             window = int(self.config.notify.rate_limit_sec)
             if (now - self._last_sent.get(umo, 0)) < window and not force:
                 continue
-            ok = await self._send_one(umo, text)
+            ok = await self._send_one(umo, text, count_failure=count_failure)
             if ok:
                 self._last_sent[umo] = now
                 sent = True
         return sent
 
-    async def _send_one(self, umo: str, text: str) -> bool:
+    async def _send_one(self, umo: str, text: str, *,
+                        count_failure: bool = True) -> bool:
         for attempt in range(2):
             try:
                 await self._sender(umo, text)
@@ -93,7 +100,11 @@ class Notifier:
                     logger.debug(f"[guardian] 通知重试 {mask_umo(umo)}: {exc}")
                     continue
                 logger.warning(f"[guardian] 通知失败 {mask_umo(umo)}: {exc}")
-                self._mark_invalid(umo)
+                if count_failure:
+                    self._mark_invalid(umo)
+                else:
+                    logger.debug(
+                        f"[guardian] 通知失败不计入拉黑（transient）: {mask_umo(umo)}")
         return False
 
     def _mark_invalid(self, umo: str) -> None:
