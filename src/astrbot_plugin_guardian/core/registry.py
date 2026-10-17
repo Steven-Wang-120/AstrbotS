@@ -5,20 +5,21 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Type
+from collections.abc import Callable
+from typing import Any
 
-_REGISTRY: dict[str, Type[Any]] = {}
+_REGISTRY: dict[str, type[Any]] = {}
 
 
-def register_probe(name: str) -> Callable[[Type[Any]], Type[Any]]:
-    def deco(cls: Type[Any]) -> Type[Any]:
+def register_probe(name: str) -> Callable[[type[Any]], type[Any]]:
+    def deco(cls: type[Any]) -> type[Any]:
         cls.probe_name = name
         _REGISTRY[name] = cls
         return cls
     return deco
 
 
-def get_probe(name: str) -> Type[Any] | None:
+def get_probe(name: str) -> type[Any] | None:
     return _REGISTRY.get(name)
 
 

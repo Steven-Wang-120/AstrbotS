@@ -13,11 +13,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import random
 import time
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from .log import logger
 
@@ -271,10 +273,8 @@ class Scheduler:
         self._stop.set()
         if self._task and not self._task.done():
             self._task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
         self._task = None
         self.clear()
 

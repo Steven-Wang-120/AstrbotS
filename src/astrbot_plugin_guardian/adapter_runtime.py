@@ -31,7 +31,7 @@ from .core.log import logger
 from .ipc.backend import IpcBackend, LocalBackend
 from .ipc.client import KernelIpcClient
 from .ipc.protocol import EV_NOTIFY, IpcError
-from .kernel_runtime import PLUGIN_NAME, GuardianKernel, default_data_dir  # noqa: F401
+from .kernel_runtime import PLUGIN_NAME, GuardianKernel, default_data_dir
 
 #: `note_event` 的合并窗口：每条用户消息都发一次 IPC 太贵，10s 内合并成一次。
 NOTE_EVENT_COALESCE_SEC = 10.0

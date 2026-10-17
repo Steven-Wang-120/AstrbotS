@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from dataclasses import dataclass
 
@@ -53,19 +54,15 @@ async def run_argv(argv: list[str], timeout: float = 15.0,
     try:
         stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        try:
+        with contextlib.suppress(ProcessLookupError):
             proc.kill()
-        except ProcessLookupError:
-            pass
         await proc.wait()
         return CmdResult(rc=124, timed_out=True,
                          stderr=f"命令超时（{timeout}s）",
                          elapsed_ms=int((time.time() - started) * 1000))
     except asyncio.CancelledError:
-        try:
+        with contextlib.suppress(ProcessLookupError):
             proc.kill()
-        except ProcessLookupError:
-            pass
         raise
     elapsed = int((time.time() - started) * 1000)
     result = CmdResult(

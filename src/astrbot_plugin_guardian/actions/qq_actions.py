@@ -28,10 +28,8 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
 
 from ..core.log import logger
-
 from ..core.models import ActionResult, ActionSpec, Severity
 from ..utils.dockerclient import DockerError, DockerUnavailable
 from ..utils.napcat import NapCatAuthError, NapCatError
@@ -138,7 +136,7 @@ class QqReloginAction(Action):
                 except (DockerUnavailable, DockerError) as exc:
                     self.audit.append(kind="qq.restart_failed", target="qq",
                                       detail=f"重启 {napcat_name} 失败: {exc}", ok=False)
-                    return self._result(False, "；".join(steps + [f"重启 {napcat_name} 失败: {exc}"]),
+                    return self._result(False, "；".join([*steps, f"重启 {napcat_name} 失败: {exc}"]),
                                         started)
 
         # ---- [3] 等待就绪 --------------------------------------------- #
@@ -321,7 +319,7 @@ class QqReloginAction(Action):
             self._last_fail_message = str(exc)
             return False, f"账密登录请求失败：{exc}"
         finally:
-            password_md5 = ""  # noqa: F841 —— 主动丢弃局部引用
+            password_md5 = ""
 
         kind = str(res.get("kind") or "failed")
         message = str(res.get("message") or "")

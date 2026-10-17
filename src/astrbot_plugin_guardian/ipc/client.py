@@ -23,7 +23,8 @@ import json
 import os
 import secrets
 import time
-from typing import Any, Awaitable, Callable
+from collections.abc import Callable
+from typing import Any
 
 from ..core.log import logger
 from .methods import MUTATING_METHODS
@@ -83,7 +84,7 @@ class KernelHealth:
     # ------------------------------------------------------------------ #
     def load(self) -> None:
         try:
-            with open(self.path, "r", encoding="utf-8") as fh:
+            with open(self.path, encoding="utf-8") as fh:
                 raw = json.load(fh)
             if isinstance(raw, dict):
                 for key in self.FIELDS:
@@ -241,7 +242,7 @@ class KernelIpcClient:
 
     def last_heartbeat(self) -> float:
         try:
-            with open(self.heartbeat_path, "r", encoding="utf-8") as fh:
+            with open(self.heartbeat_path, encoding="utf-8") as fh:
                 return float((json.load(fh) or {}).get("ts") or 0.0)
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
             return 0.0
@@ -298,7 +299,7 @@ class KernelIpcClient:
     # ================================================================== #
     def _read_token(self) -> str:
         try:
-            with open(self.token_file, "r", encoding="utf-8") as fh:
+            with open(self.token_file, encoding="utf-8") as fh:
                 return fh.read().strip()
         except OSError:
             return ""
@@ -663,5 +664,10 @@ class KernelIpcClient:
         return False
 
 
-__all__ = ["KernelIpcClient", "KernelHealth", "RECONNECT_BACKOFF",
-           "NO_RETRY_METHODS", "E_UNAUTHORIZED"]
+__all__ = [
+    "E_UNAUTHORIZED",
+    "NO_RETRY_METHODS",
+    "RECONNECT_BACKOFF",
+    "KernelHealth",
+    "KernelIpcClient",
+]

@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import os
@@ -76,17 +77,15 @@ class StateStore:
             self._data = {"schema": SCHEMA_VERSION}
             return
         try:
-            with open(self.path, "r", encoding="utf-8") as fh:
+            with open(self.path, encoding="utf-8") as fh:
                 payload = json.load(fh)
             if not isinstance(payload, dict):
                 raise ValueError("state.json 根节点不是对象")
             self._data = self._migrate(payload)
         except Exception as exc:  # noqa: BLE001
             backup = self.path.with_suffix(f".corrupt.{int(time.time())}.json")
-            try:
+            with contextlib.suppress(OSError):
                 shutil.copy2(self.path, backup)
-            except OSError:
-                pass
             logger.warning(
                 f"[guardian] state.json 损坏({exc})，已备份到 {backup.name} 并重建")
             self._data = {"schema": SCHEMA_VERSION}

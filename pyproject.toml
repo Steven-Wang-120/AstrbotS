@@ -1,0 +1,40 @@
+# 仅用于工具链配置（ruff）。本仓库是 AstrBot 插件工程，不打包发布 Python 分发包。
+
+[tool.ruff]
+# 与插件声明的最低 Python 版本保持一致（AstrBot 4.5.x 系仍可能跑在 3.10 上）
+target-version = "py310"
+line-length = 100
+extend-exclude = [
+    ".venv",
+    "docs",
+    "tests",
+    "deploy",
+]
+
+[tool.ruff.lint]
+select = [
+    "E4",  # import 相关
+    "E7",  # 语句层错误
+    "E9",  # 运行时错误
+    "F",   # pyflakes
+    "W",   # pycodestyle warning
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # bugbear
+    "BLE", # blind except（本插件故意宽捕获，需带 noqa 说明原因）
+    "SIM", # simplify
+    "RET", # return 风格
+    "RUF", # ruff 自有规则
+]
+ignore = [
+    # 类级可变默认值：本插件里都是常量表 / 无实例共享风险的查表结构
+    "RUF012",
+    # 中文全角标点（：，（）、）在中文注释与文案里是正确写法，不是易混淆字符
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 包入口只做再导出
+"__init__.py" = ["F401"]

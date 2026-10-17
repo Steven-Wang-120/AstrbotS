@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -24,7 +24,7 @@ class LevelSpec:
     action: str = "none"  # none | notify | arm_sleep | force_sleep
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any]) -> "LevelSpec":
+    def from_dict(cls, d: dict[str, Any]) -> LevelSpec:
         return cls(
             id=str(d.get("id") or "L0"),
             name=str(d.get("name") or "常规"),
@@ -62,7 +62,7 @@ class LifecycleState:
         }
 
     @classmethod
-    def from_dict(cls, d: dict[str, Any] | None) -> "LifecycleState":
+    def from_dict(cls, d: dict[str, Any] | None) -> LifecycleState:
         st = cls()
         for k, v in (d or {}).items():
             if hasattr(st, k) and v is not None:

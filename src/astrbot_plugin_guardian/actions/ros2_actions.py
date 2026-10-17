@@ -38,7 +38,7 @@ class Ros2RestartNodeAction(Action):
     async def _verify_node(self, node: str, attempts: int = 3,
                            wait: float = 4.0) -> tuple[bool, str]:
         last = "未知"
-        for i in range(attempts):
+        for _ in range(attempts):
             await asyncio.sleep(wait)
             out = await self.ros2.node_list()
             if not out.ok:

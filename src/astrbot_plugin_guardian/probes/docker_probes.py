@@ -5,10 +5,7 @@
 
 from __future__ import annotations
 
-import time
 from typing import Any
-
-from ..core.log import logger
 
 from ..core.models import Severity, Status
 from ..core.registry import register_probe

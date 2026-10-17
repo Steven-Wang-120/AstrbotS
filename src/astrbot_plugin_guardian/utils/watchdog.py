@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
-from pathlib import Path
 import tempfile
 import time
 import uuid
+from pathlib import Path
 
 from ..core.models import ActionSpec
 from .dockerclient import DockerError
@@ -129,7 +130,5 @@ async def _reconcile_locked(engine) -> None:
         from ..core.models import Severity
         text = ("[睡眠] 宿主机确认睡眠流程完成，全部目标已运行且健康检查通过。" if completed else
                 f"[睡眠] 宿主机执行未成功：{result.get('detail', status)}。请检查宿主机执行记录。")
-        try:
+        with contextlib.suppress(Exception):
             await engine.notifier.push(text, severity=Severity.INFO if completed else Severity.CRIT, force=True)
-        except Exception:
-            pass

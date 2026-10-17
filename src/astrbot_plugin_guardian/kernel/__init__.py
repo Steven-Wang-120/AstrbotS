@@ -11,6 +11,6 @@
 
 from __future__ import annotations
 
-from .service import KernelService, main  # noqa: F401
+from .service import KernelService, main
 
 __all__ = ["KernelService", "main"]

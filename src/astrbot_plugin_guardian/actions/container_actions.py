@@ -13,7 +13,6 @@ import asyncio
 import time
 
 from ..core.log import logger
-
 from ..core.models import ActionResult, ActionSpec
 from ..utils.dockerclient import DockerError, DockerUnavailable
 from .base import Action, register_action
@@ -101,6 +100,7 @@ class RestartContainerAction(Action):
         timeout = int(spec.params.get("timeout", 10))
         if self.config.is_self(name):
             from dataclasses import replace
+
             from .sleep import SleepAction
             params = dict(spec.params, targets=[name], duration_min=0)
             delegated = replace(spec, kind="sleep", params=params)

@@ -17,7 +17,8 @@ from __future__ import annotations
 
 import math
 import time
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 from .protocol import (
     E_BAD_REQUEST,
@@ -203,7 +204,7 @@ def build_handlers(kernel: Any) -> dict[str, Handler]:
     # ---- 适配层 → 内核的记账（审计/活跃度由内核单写者持有，I1） ---------- #
     async def h_note_event(p: dict) -> None:
         kernel.note_event()
-        return None
+        return
 
     async def h_audit_append(p: dict) -> None:
         kernel.audit_append(
@@ -213,7 +214,7 @@ def build_handlers(kernel: Any) -> dict[str, Handler]:
             ok=_as_bool(p.get("ok"), True),
             actor=_as_str(p.get("actor"), "llm", limit=32) or "llm",
             trigger=_as_str(p.get("trigger"), "llm", limit=32) or "llm")
-        return None
+        return
 
     # ---- 探活 ---------------------------------------------------------- #
     async def h_ping(p: dict) -> dict:
@@ -285,6 +286,12 @@ def extra_methods(handlers: dict[str, Handler]) -> list[str]:
 
 
 __all__ = [
-    "Handler", "build_handlers", "METHOD_NAMES", "MUTATING_METHODS",
-    "missing_methods", "extra_methods", "E_UNKNOWN_METHOD", "E_INTERNAL",
+    "E_INTERNAL",
+    "E_UNKNOWN_METHOD",
+    "METHOD_NAMES",
+    "MUTATING_METHODS",
+    "Handler",
+    "build_handlers",
+    "extra_methods",
+    "missing_methods",
 ]

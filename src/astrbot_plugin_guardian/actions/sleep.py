@@ -18,10 +18,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 
 from ..core.log import logger
-
 from ..core.models import ActionResult, ActionSpec, Severity
 from ..utils.dockerclient import DockerError, DockerUnavailable
 from ..utils.watchdog import submit_sleep
@@ -51,7 +51,7 @@ class SleepAction(Action):
             await self.engine.notifier.push(
                 f"[睡眠] 即将执行：目标 {', '.join(targets)}，时长 {duration} 分钟，原因：{reason}",
                 severity=Severity.WARN, force=True)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 —— 通知失败不能阻断睡眠主流程
             logger.warning(f"[guardian] 睡眠前通知失败: {exc}")
 
         self_targets = [t for t in targets if self.config.is_self(t)]
@@ -153,10 +153,8 @@ class SleepAction(Action):
         self.engine.state.set("lifecycle.state", self.engine.lifecycle_state.to_dict())
         await self.engine.state.flush(force=True)
         if self.config.lifecycle.post_sleep_notify:
-            try:
+            with contextlib.suppress(Exception):
                 await self.engine.notifier.push("[睡眠] 睡眠流程完成，全部目标已复核运行。", severity=Severity.INFO, force=True)
-            except Exception:
-                pass
         return result(True, f"直连睡眠完成并复核运行（StartedAt 已更新）：{targets}", "direct")
 
     # ------------------------------------------------------------------ #

@@ -26,8 +26,6 @@ import contextlib
 import json
 import os
 import signal
-import sys
-import time
 from typing import Any
 
 from ..core.config import build_config
@@ -44,7 +42,7 @@ def load_raw_config(*, config_file: str = "", inline: str = "") -> dict[str, Any
     path = (config_file or os.environ.get(CONFIG_FILE_ENV) or "").strip()
     if path:
         try:
-            with open(path, "r", encoding="utf-8-sig") as fh:
+            with open(path, encoding="utf-8-sig") as fh:
                 data = json.load(fh)
             if isinstance(data, dict):
                 return data

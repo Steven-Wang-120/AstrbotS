@@ -12,7 +12,6 @@ import time
 from typing import Any
 
 from ..core.log import logger
-
 from ..core.models import ProbeResult, Severity, Status
 
 

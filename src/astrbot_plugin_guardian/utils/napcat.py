@@ -25,7 +25,8 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 import aiohttp
 
@@ -102,7 +103,7 @@ class NapCatClient:
             return {}
         try:
             data = json.loads(body)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise NapCatError(f"NapCat 返回畸形 JSON: {body[:120]}") from exc
         return data if isinstance(data, dict) else {"data": data}
 
@@ -348,8 +349,7 @@ class NapCatClient:
         uin = str(self.account or "").strip()
         if not uin:
             raise NapCatError("未配置 qq.account，无法快速登录")
-        resp = await self._webui_post("/api/QQLogin/SetQuickLogin", {"uin": uin})
-        return resp
+        return await self._webui_post("/api/QQLogin/SetQuickLogin", {"uin": uin})
 
     async def close(self) -> None:
         if self._session and not self._session.closed:

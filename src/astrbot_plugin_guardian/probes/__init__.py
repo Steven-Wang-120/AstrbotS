@@ -1,6 +1,6 @@
 """探针包：import 各探针模块以完成注册（副作用导入）。"""
 
-from . import (  # noqa: F401
+from . import (
     container_memory,
     docker_probes,
     qq_login,

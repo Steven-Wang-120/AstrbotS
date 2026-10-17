@@ -9,6 +9,7 @@ dist/
 .venv/
 venv/
 env/
+.ruff_cache/
 
 # ---- 运行时状态与审计日志（不入库）----
 src/data/guardian/

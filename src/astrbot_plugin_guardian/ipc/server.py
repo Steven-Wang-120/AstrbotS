@@ -161,7 +161,7 @@ class KernelIpcServer:
 
     async def _probe_existing_unix(self) -> bool:
         try:
-            reader, writer = await asyncio.wait_for(
+            _reader, writer = await asyncio.wait_for(
                 asyncio.open_unix_connection(self.socket_path), timeout=1.5)
         except (OSError, asyncio.TimeoutError):
             return False
@@ -393,4 +393,4 @@ class KernelIpcServer:
                 f"{text[:120]}")
 
 
-__all__ = ["KernelIpcServer", "unix_socket_supported", "DEFAULT_TCP_PORT"]
+__all__ = ["DEFAULT_TCP_PORT", "KernelIpcServer", "unix_socket_supported"]

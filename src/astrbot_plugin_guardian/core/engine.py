@@ -12,16 +12,15 @@ import asyncio
 import time
 from typing import Any
 
-from .log import logger
-
 from ..actions.base import get_action
 from ..notify.notifier import Notifier
-from ..utils.textutil import fmt_ts, human_duration, severity_icon, status_icon
+from ..utils.textutil import fmt_ts, human_duration, status_icon
 from . import registry  # noqa: F401  触发探针注册
 from .audit import AuditLog
 from .bus import EventBus
 from .config import GuardianConfig
 from .lifecycle import LifecyclePolicy, LifecycleState
+from .log import logger
 from .models import (
     ActionSpec,
     Finding,
@@ -29,7 +28,6 @@ from .models import (
     ProbeResult,
     Severity,
     Status,
-    new_incident_id,
     severity_at_least,
     worst_status,
 )
@@ -285,7 +283,7 @@ class HealthEngine:
             return
         targets = ", ".join(f"{t}(x{n})" for t, n in degraded)
         self.audit.append(kind="safety.degrade", target=targets,
-                          detail=f"连续失败达阈值，降级为只告警并进入 maintenance",
+                          detail="连续失败达阈值，降级为只告警并进入 maintenance",
                           trigger=trigger, suppressed=True, reason="fail_streak")
         current = self.state.get("profile") or self.config.profile
         if current != "maintenance":
@@ -519,7 +517,7 @@ class HealthEngine:
             lines.append(f"总体: {overall.value.upper()}")
 
         mem_lines = []
-        for key, res in self._last_results.items():
+        for res in self._last_results.values():
             if res.probe == "container_memory" and "mem_mb" in res.metrics:
                 mem_lines.append(
                     f"  {res.target}: {res.metrics['mem_mb']:.0f}MB "

@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
 # 触发探针/动作注册（import 副作用）
 from . import actions as _actions  # noqa: F401

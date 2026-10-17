@@ -12,10 +12,8 @@
 from __future__ import annotations
 
 import time
-from typing import Any
 
 from ..core.log import logger
-
 from ..core.models import Incident, Severity, severity_at_least
 from ..utils.textutil import mask_umo, truncate
 
@@ -61,10 +59,9 @@ class Notifier:
 
         now = time.time()
         key = self._dedup_key(text, target, status)
-        if not force:
-            if (now - self._dedup.get(key, 0)) < int(self.config.notify.rate_limit_sec):
-                logger.debug(f"[guardian] 通知去重: {truncate(text, 40)}")
-                return False
+        if not force and (now - self._dedup.get(key, 0)) < int(self.config.notify.rate_limit_sec):
+            logger.debug(f"[guardian] 通知去重: {truncate(text, 40)}")
+            return False
         self._dedup[key] = now
 
         umos = list(self.config.notify.umo_list or [])
@@ -124,8 +121,8 @@ class Notifier:
         if not incidents:
             return
         lines = [i.one_line() for i in incidents]
-        text = "[守护] 本轮发现 %d 项异常：\n%s" % (
-            len(incidents), "\n".join(f"  - {ln}" for ln in lines[:10]))
+        text = (f"[守护] 本轮发现 {len(incidents)} 项异常：\n"
+                + "\n".join(f"  - {ln}" for ln in lines[:10]))
         worst = max((i.severity for i in incidents),
                     key=lambda s: severity_at_least(s, Severity.INFO) and list(Severity).index(s))
         target = incidents[0].target

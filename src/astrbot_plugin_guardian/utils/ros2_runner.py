@@ -15,7 +15,6 @@ import shlex
 from dataclasses import dataclass
 
 from ..core.log import logger
-
 from ..core.safety import ALLOWED_COMMAND_PREFIXES, validate_command
 from .dockerclient import DockerClient, DockerError, DockerUnavailable
 from .shell import CmdResult, run_argv

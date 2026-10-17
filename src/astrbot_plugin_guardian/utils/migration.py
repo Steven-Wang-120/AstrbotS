@@ -134,6 +134,12 @@ def migrate_legacy_data(new_dir: str, legacy_dir: str, *,
     return result
 
 
-__all__ = ["MIGRATION_MARKER", "MIGRATED_FILES", "LEGACY_RELATIVE",
-           "STATE_SUBDIR", "resolve_legacy_data_dir", "locate_state_dir",
-           "migrate_legacy_data"]
+__all__ = [
+    "LEGACY_RELATIVE",
+    "MIGRATED_FILES",
+    "MIGRATION_MARKER",
+    "STATE_SUBDIR",
+    "locate_state_dir",
+    "migrate_legacy_data",
+    "resolve_legacy_data_dir",
+]

@@ -5,11 +5,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Type
+from typing import Any
 
 from ..core.models import ActionResult, ActionSpec
 
-_REGISTRY: dict[str, Type[Any]] = {}
+_REGISTRY: dict[str, type[Any]] = {}
 
 
 def register_action(kind: str):
@@ -37,7 +37,7 @@ class Action:
         raise NotImplementedError
 
 
-def get_action(kind: str) -> Type[Action] | None:
+def get_action(kind: str) -> type[Action] | None:
     return _REGISTRY.get(kind)
 
 

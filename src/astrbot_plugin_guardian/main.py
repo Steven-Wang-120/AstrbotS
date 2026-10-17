@@ -14,17 +14,19 @@ from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
+
 try:
     # AstrBot 4.2x：filter 是独立子模块，EventMessageType/装饰器都在其下
     from astrbot.api.event.filter import EventMessageType
 except ImportError:  # pragma: no cover - 兼容更早/非标准布局
     from astrbot.api.event import EventMessageType  # type: ignore
+import contextlib
+
 from astrbot.api.star import Context, Star
 
-try:  # AstrBot >= 4.x
-    from astrbot.api.star import register
-except ImportError:  # pragma: no cover - 兼容旧版
-    from astrbot.api import register  # type: ignore
+# 说明：AstrBot 自 v3.5.19 起不再需要 `@register` 装饰器——它会自动识别继承
+# `Star` 的类作为插件类，插件元数据以 metadata.yaml 为准。旧装饰器已被官方
+# 标记 DEPRECATED，故此处不再使用。
 
 # --------------------------------------------------------------------------- #
 # 导入运行时（相对导入失败时回退为显式包导入）
@@ -88,7 +90,6 @@ def _event_text(event: AstrMessageEvent) -> str:
     return getattr(event, "message_str", "") or ""
 
 
-@register(PLUGIN_NAME, PLUGIN_DESC, PLUGIN_AUTHOR, PLUGIN_VERSION)
 class GuardianPlugin(Star):
     def __init__(self, context: Context, config: Any = None):
         super().__init__(context)
@@ -174,10 +175,8 @@ class GuardianPlugin(Star):
     # ================================================================== #
     @filter.event_message_type(EventMessageType.ALL)
     async def observe_message(self, event: AstrMessageEvent):
-        try:
+        with contextlib.suppress(Exception):
             await self.runtime.note_event()
-        except Exception:  # noqa: BLE001
-            pass
 
     # ================================================================== #
     # 命令入口
@@ -266,10 +265,8 @@ class GuardianPlugin(Star):
         if sub == "incidents":
             limit = 10
             if len(args) > 1:
-                try:
+                with contextlib.suppress(ValueError):
                     limit = int(args[1])
-                except ValueError:
-                    pass
             return await rt.incidents_text(limit)
         if sub == "diagnose":
             target = args[1] if len(args) > 1 else "all"

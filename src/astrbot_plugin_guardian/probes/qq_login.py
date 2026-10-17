@@ -10,7 +10,6 @@ from typing import Any
 
 from ..core.models import Severity, Status
 from ..core.registry import register_probe
-from ..utils.napcat import NapCatError
 from .base import Probe
 
 
@@ -43,7 +42,7 @@ class QqLoginProbe(Probe):
                                          self.napcat.get_login_info(),
                                          return_exceptions=True)
         errors: list[str] = []
-        for action, response in zip(("get_status", "get_login_info"), responses):
+        for action, response in zip(("get_status", "get_login_info"), responses, strict=False):
             if isinstance(response, BaseException):
                 if isinstance(response, asyncio.CancelledError):
                     raise response

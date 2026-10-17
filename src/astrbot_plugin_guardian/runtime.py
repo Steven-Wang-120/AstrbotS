@@ -16,13 +16,13 @@
 
 from __future__ import annotations
 
-from .adapter_runtime import (  # noqa: F401
+from .adapter_runtime import (
     GuardianAdapter,
     GuardianRuntime,
     build_chain,
     resolve_data_dir,
 )
-from .kernel_runtime import (  # noqa: F401
+from .kernel_runtime import (
     DEFAULT_DATA_DIR_ENV,
     PLUGIN_NAME,
     GuardianKernel,
@@ -32,11 +32,11 @@ from .kernel_runtime import (  # noqa: F401
 
 __all__ = [
     "DEFAULT_DATA_DIR_ENV",
+    "PLUGIN_NAME",
     "GuardianAdapter",
     "GuardianKernel",
     "GuardianRuntime",
     "KernelRuntime",
-    "PLUGIN_NAME",
     "build_chain",
     "default_data_dir",
     "resolve_data_dir",

@@ -12,10 +12,8 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
 
 from .log import logger
-
 from .models import ActionSpec
 
 # 允许被动作作用的 kind

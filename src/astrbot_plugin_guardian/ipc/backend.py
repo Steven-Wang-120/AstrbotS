@@ -111,4 +111,4 @@ class IpcBackend:
         self.client.on_state(cb)
 
 
-__all__ = ["LocalBackend", "IpcBackend"]
+__all__ = ["IpcBackend", "LocalBackend"]

@@ -698,13 +698,14 @@ class GuardianConfig:
         lc["sleep_targets"] = sleep_targets
         if not sleep_targets:
             issues.append("lifecycle.sleep_targets 为空，睡眠功能不可用（仅告警）")
-        elif self.is_self(self.self_container) and not safety.get("allow_self_restart"):
-            if self.self_container in sleep_targets:
-                issues.append(
-                    f"sleep_targets 含本体容器 {self.self_container} 但 "
-                    "safety.allow_self_restart=false，睡眠时会自动跳过本体"
-                    "（仅睡眠其他目标）。如需本体参与睡眠，请开启 "
-                    "allow_self_restart 并部署看门狗。")
+        elif (self.is_self(self.self_container)
+              and not safety.get("allow_self_restart")
+              and self.self_container in sleep_targets):
+            issues.append(
+                f"sleep_targets 含本体容器 {self.self_container} 但 "
+                "safety.allow_self_restart=false，睡眠时会自动跳过本体"
+                "（仅睡眠其他目标）。如需本体参与睡眠，请开启 "
+                "allow_self_restart 并部署看门狗。")
 
         up_targets = self.resolve_targets(lc.get("uptime_targets"))
         if not up_targets:

@@ -16,7 +16,6 @@ from .models import (
     ActionSpec,
     Finding,
     ProbeResult,
-    Severity,
     Status,
 )
 

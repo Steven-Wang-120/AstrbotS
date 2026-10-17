@@ -131,7 +131,7 @@ class AuditLog:
         if not self.path.exists():
             return []
         try:
-            with open(self.path, "r", encoding="utf-8") as fh:
+            with open(self.path, encoding="utf-8") as fh:
                 lines = fh.readlines()[-limit:]
             out = []
             for ln in lines:

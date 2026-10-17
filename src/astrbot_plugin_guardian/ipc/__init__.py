@@ -13,7 +13,7 @@
 
 from __future__ import annotations
 
-from .protocol import (  # noqa: F401
+from .protocol import (
     E_BAD_REQUEST,
     E_INTERNAL,
     E_KERNEL_BUSY,
@@ -32,19 +32,19 @@ from .protocol import (  # noqa: F401
 )
 
 __all__ = [
-    "IpcError",
-    "LineDecoder",
-    "make_request",
-    "make_response",
-    "make_error",
-    "make_event",
-    "E_KERNEL_UNAVAILABLE",
-    "E_KERNEL_TIMEOUT",
+    "E_BAD_REQUEST",
+    "E_INTERNAL",
     "E_KERNEL_BUSY",
     "E_KERNEL_ERROR",
+    "E_KERNEL_TIMEOUT",
+    "E_KERNEL_UNAVAILABLE",
     "E_SAFETY_DENIED",
-    "E_BAD_REQUEST",
-    "E_UNKNOWN_METHOD",
     "E_UNAUTHORIZED",
-    "E_INTERNAL",
+    "E_UNKNOWN_METHOD",
+    "IpcError",
+    "LineDecoder",
+    "make_error",
+    "make_event",
+    "make_request",
+    "make_response",
 ]
