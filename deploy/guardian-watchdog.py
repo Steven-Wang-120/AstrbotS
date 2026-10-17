@@ -107,6 +107,10 @@ class AdvisoryLock:
                 self.stream.close()
 
 
+def truthy(value):
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
 class Config:
     def __init__(self, env=None):
         env = os.environ if env is None else env
@@ -128,8 +132,35 @@ class Config:
         self.state = self.request.parent / "watchdog_state.json"
         self.lock = self.request.parent / "watchdog_state.lock"
         self.processing = Path(str(self.request) + ".processing")
+
+        # ---- 域 C 的内核心跳守护（B16 §4 / §9 M4 / §12.3.5） ------------ #
+        # 内核无法可靠地重启自己，所以"内核卡死 → 重启内核容器"必须由宿主看门狗
+        # 负责。两条触发源（心跳超时 / 适配层重载请求）共用**同一条重启路径**。
+        self.kernel_guard = truthy(env.get("GUARDIAN_KERNEL_GUARD", "1"))
+        self.kernel_container = env.get("GUARDIAN_KERNEL_CONTAINER", "guardian-kernel").strip()
+        self.kernel_heartbeat = Path(env.get(
+            "GUARDIAN_KERNEL_HEARTBEAT_FILE", str(data_dir / "kernel_heartbeat.json")))
+        self.kernel_reload_request = Path(env.get(
+            "GUARDIAN_KERNEL_RELOAD_REQUEST_FILE",
+            str(data_dir / "kernel_reload_request.json")))
+        self.kernel_reload_processing = Path(str(self.kernel_reload_request) + ".processing")
+        self.kernel_state = Path(env.get(
+            "GUARDIAN_KERNEL_STATE_FILE", str(data_dir / "watchdog_kernel_state.json")))
+        self.kernel_lock = Path(str(self.kernel_state) + ".lock")
+        self.kernel_timeout = float(env.get("GUARDIAN_KERNEL_HEARTBEAT_TIMEOUT", "90"))
+        self.kernel_cooldown = float(env.get("GUARDIAN_KERNEL_RESTART_COOLDOWN", "300"))
+        if (not math.isfinite(self.kernel_timeout) or self.kernel_timeout <= 0 or
+                not math.isfinite(self.kernel_cooldown) or self.kernel_cooldown < 0):
+            raise ValueError("invalid watchdog kernel-guard configuration")
+        if self.kernel_guard and not self.kernel_container:
+            raise ValueError("kernel container name must not be empty when the guard is enabled")
+        if self.kernel_container and not TARGET.fullmatch(self.kernel_container):
+            raise ValueError("invalid kernel container name")
+
         paths = [path.resolve() for path in
-                 (self.request, self.processing, self.result, self.state, self.lock, self.log)]
+                 (self.request, self.processing, self.result, self.state, self.lock, self.log,
+                  self.kernel_heartbeat, self.kernel_reload_request,
+                  self.kernel_reload_processing, self.kernel_state, self.kernel_lock)]
         if len(set(paths)) != len(paths):
             raise ValueError("watchdog input, output, state and log paths must be distinct")
 
@@ -162,6 +193,13 @@ class Docker:
             arguments = self.compose(arguments)
         return self.command(arguments) is not None
 
+    def kernel_restart(self, container):
+        """重启内核容器（B16 §4：容器无法可靠地重启自己，必须由宿主执行）。"""
+        arguments = ["restart", container]
+        if self.config.backend == "compose":
+            arguments = self.compose(arguments)
+        return self.command(arguments) is not None
+
     def running(self, target):
         if self.config.backend == "compose":
             output = self.command(self.compose(["ps", "-q", target]))
@@ -190,6 +228,149 @@ class Docker:
             return False
 
 
+class KernelGuard:
+    """域 C 的内核心跳守护 + 适配层重载请求消费（B16 §4 / §9 M4 / §12.3.5）。
+
+    **为什么这条必须留在宿主**：容器无法可靠地重启自己——自杀式重启后不保证能
+    回来。所以"内核卡死 → 重启内核容器"只能由看门狗做（B16 §4）。
+
+    两条触发源（① 内核心跳超时 ② 适配层写下的 reload 请求）共用**同一条重启
+    路径**：同一把 flock、同一套 nonce 去重、同一个冷却计时。这样"心跳守护"与
+    "适配层请求"不会并发打架（B16 §4 的关键结论）。
+    """
+
+    def __init__(self, config, docker, clock=time.time, persist=atomic_json,
+                 log=lambda message: None):
+        self.config = config
+        self.docker = docker
+        self.clock = clock
+        self.persist = persist
+        self.log = log
+        self.state = None
+
+    # ------------------------------------------------------------------ #
+    def load_state(self):
+        try:
+            state = strict_json(self.config.kernel_state.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            state = {"seen": {}, "last_restart_ts": 0.0}
+        if (not isinstance(state, dict) or set(state) != {"seen", "last_restart_ts"} or
+                not isinstance(state["seen"], dict) or
+                not finite_number(state["last_restart_ts"])):
+            raise ValueError("invalid-kernel-ledger")
+        for nonce, timestamp in state["seen"].items():
+            if not NONCE.fullmatch(nonce) or not finite_number(timestamp):
+                raise ValueError("invalid-kernel-ledger")
+        self.state = state
+
+    def save(self):
+        cutoff = self.clock() - (self.config.max_age + 60)
+        self.state["seen"] = {nonce: timestamp
+                              for nonce, timestamp in self.state["seen"].items()
+                              if timestamp >= cutoff}
+        self.persist(self.config.kernel_state, self.state)
+
+    def heartbeat_age(self):
+        """返回 (age_seconds, detail)。内核从未部署过时返回 (None, 'no-heartbeat')。
+
+        **不擅自重启**：心跳文件不存在说明内核从未在这台宿主上跑过，此时重启
+        `guardian-kernel` 只会制造无意义的噪声。只有"曾经有心跳、现在过期了"
+        才判定为卡死。
+        """
+        path = self.config.kernel_heartbeat
+        if not path.exists():
+            return None, "no-heartbeat"
+        try:
+            payload = strict_json(path.read_text(encoding="utf-8"))
+            timestamp = float((payload or {}).get("ts"))
+        except (OSError, ValueError, TypeError, AttributeError, UnicodeError):
+            return None, "unreadable-heartbeat"
+        if not math.isfinite(timestamp):
+            return None, "unreadable-heartbeat"
+        return self.clock() - timestamp, "ok"
+
+    def _restart(self, reason):
+        now = self.clock()
+        last = float(self.state.get("last_restart_ts") or 0.0)
+        if now - last < self.config.kernel_cooldown:
+            self.log("Kernel restart suppressed by cooldown: " + reason)
+            return {"restarted": False, "reason": reason, "detail": "cooldown"}
+        ok = self.docker.kernel_restart(self.config.kernel_container)
+        self.state["last_restart_ts"] = now
+        self.save()
+        self.log("Kernel restart ({}) -> {}".format(reason, "ok" if ok else "failed"))
+        return {"restarted": bool(ok), "reason": reason,
+                "detail": "restarted" if ok else "restart-failed"}
+
+    def consume_reload_request(self):
+        processing = self.config.kernel_reload_processing
+        if not processing.exists():
+            if not self.config.kernel_reload_request.exists():
+                return None
+            try:
+                os.replace(self.config.kernel_reload_request, processing)
+            except OSError:
+                return None
+        try:
+            payload = strict_json(processing.read_text(encoding="utf-8"))
+        except (OSError, ValueError, UnicodeError):
+            payload = None
+        try:
+            if not isinstance(payload, dict):
+                result = {"restarted": False, "reason": "reload-request",
+                          "detail": "invalid-request"}
+            else:
+                nonce, timestamp = payload.get("nonce"), payload.get("ts")
+                if (not isinstance(nonce, str) or not NONCE.fullmatch(nonce) or
+                        not finite_number(timestamp)):
+                    result = {"restarted": False, "reason": "reload-request",
+                              "detail": "invalid-request"}
+                elif nonce in self.state["seen"]:
+                    result = {"restarted": False, "reason": "reload-request",
+                              "detail": "replay"}
+                else:
+                    age = self.clock() - timestamp
+                    if age > self.config.max_age or age < -60:
+                        result = {"restarted": False, "reason": "reload-request",
+                                  "detail": "stale-request"}
+                    else:
+                        self.state["seen"][nonce] = self.clock()
+                        self.save()
+                        result = self._restart("reload-request")
+        finally:
+            try:
+                processing.unlink()
+            except FileNotFoundError:
+                pass
+        return result
+
+    def tick(self):
+        if not self.config.kernel_guard:
+            return None
+        try:
+            with AdvisoryLock(self.config.kernel_lock) as acquired:
+                if not acquired:
+                    return None
+                try:
+                    self.load_state()
+                except (OSError, ValueError, UnicodeError) as error:
+                    self.log("Kernel ledger error: " + str(error))
+                    return {"restarted": False, "reason": "ledger",
+                            "detail": "ledger-error"}
+                requested = self.consume_reload_request()
+                if requested is not None:
+                    return requested
+                age, _detail = self.heartbeat_age()
+                if age is None:
+                    return None
+                if age > self.config.kernel_timeout or age < -60:
+                    return self._restart("heartbeat-timeout")
+                return None
+        except OSError as error:
+            self.log("Kernel guard lock error: " + str(error))
+            return None
+
+
 class Watchdog:
     def __init__(self, config, docker=None, clock=time.time, persist=atomic_json):
         self.config = config
@@ -197,6 +378,8 @@ class Watchdog:
         self.persist = persist
         self.docker = docker if docker is not None else Docker(config, log=self.log)
         self.ledger = None
+        self.kernel_guard = KernelGuard(config, self.docker, clock, persist, self.log)
+        self.last_kernel_result = None
 
     def log(self, message):
         try:
@@ -452,6 +635,14 @@ class Watchdog:
 
     def tick(self):
         self.ledger = None
+        # 域 C 的内核心跳守护（B16 §4）：自带 flock，与请求处理互不阻塞。
+        # 心跳守护失败不得拖垮请求处理，但必须留痕（I4：失败不静默）。
+        try:
+            self.last_kernel_result = self.kernel_guard.tick()
+        except Exception as error:  # noqa: BLE001
+            self.log("Kernel guard failed: " + str(error))
+            self.last_kernel_result = {"restarted": False, "reason": "guard-error",
+                                       "detail": str(error)}
         try:
             with AdvisoryLock(self.config.lock) as acquired:
                 if not acquired:

@@ -24,7 +24,9 @@
     "max_auto_reloads": 1,
     "reload_cooldown": 600,
     "reload_grace_sec": 90,
-    "reload_reset_sec": 300
+    "reload_reset_sec": 300,
+    "direct_actions": true,
+    "legacy_data_dir": "/AstrBot/data/plugin_data/astrbot_plugin_guardian"
   },
 
   "safety": {

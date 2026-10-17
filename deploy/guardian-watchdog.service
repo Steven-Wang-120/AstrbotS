@@ -12,5 +12,11 @@ TimeoutStartSec=40min
 Environment=GUARDIAN_COMPOSE_DIR=/opt/astrbot-stack
 Environment="GUARDIAN_ALLOWED_TARGETS=astrbot napcat"
 Environment=GUARDIAN_MAX_AGE_SEC=120
+# 域 C 内核心跳守护（B16 §4 / §9 M4）：内核卡死或适配层请求重载时，
+# 由看门狗用 `docker compose restart guardian-kernel` 拉起（容器无法可靠自重启）。
+Environment=GUARDIAN_KERNEL_GUARD=1
+Environment=GUARDIAN_KERNEL_CONTAINER=guardian-kernel
+Environment=GUARDIAN_KERNEL_HEARTBEAT_TIMEOUT=90
+Environment=GUARDIAN_KERNEL_RESTART_COOLDOWN=300
 ExecStart=/usr/local/bin/guardian-watchdog.sh
 Nice=5
