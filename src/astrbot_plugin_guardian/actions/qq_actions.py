@@ -135,7 +135,7 @@ class QqReloginAction(Action):
             # 会话仍有效：快速登录已把账号带回来，此时**不得**再发密码（A1 / F6）。
             steps.append(f"复核在线：{vnote}")
             await self._finalize_quick_login(steps)
-            self._on_success()
+            await self._on_success()
             await self._notify_ok(steps)
             return self._result(True, "；".join(steps), started)
         steps.append(f"复核未在线：{vnote}")
@@ -179,7 +179,7 @@ class QqReloginAction(Action):
 
         steps.append(f"复核在线：{vnote}")
         await self._finalize_quick_login(steps)
-        self._on_success()
+        await self._on_success()
         await self._notify_ok(steps)
         return self._result(True, "；".join(steps), started)
 
@@ -413,10 +413,14 @@ class QqReloginAction(Action):
             return 0.0
         return max(0.0, until - time.time())
 
-    def _on_success(self) -> None:
+    async def _on_success(self) -> None:
         self.state.set("qq_fail_streak", 0)
         self.state.set("qq.auth_hold_until", 0)
         self.state.set("qq.last_success_at", time.time())
+        # 成功同样必须立即落盘（与失败出口对称）。否则进程紧接着被强杀时，
+        # 磁盘上会留着旧的 `qq.auth_hold_until`，重启后即使 QQ 已恢复，下一轮
+        # 掉线也会被判"静默期内跳过"，白等最多 `password_fail_hold_sec`。
+        await self.state.flush(force=True)
 
     # ================================================================== #
     # 通知与落盘

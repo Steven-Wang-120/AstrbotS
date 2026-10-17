@@ -79,7 +79,7 @@ bash tests/run_all.sh
 | `test_kernel_ipc.py` | **内核 IPC 契约**（B16 §10）：全 method 请求/响应/错误/超时/断连；断连必须显式失败；D4-a+ 自修复有界性 C1–C4；inproc 与 ipc 两后端结果一致性；独立内核进程（M3）验收；**+ 重连后破坏性方法不重试、长任务超时放大** | 40 |
 | `test_kernel_guard.py` | **M4/M5 专项**：数据目录迁移幂等/非覆盖/可回滚、`direct_actions` 生效判定、`StartedAt`+健康复核（含 `starting` 过渡态）、直连睡眠清 `forced_at`、docker 失效回退看门狗 | 17 |
 | `test_adversarial.py` | **对抗性边界**：非法/自相矛盾输入、状态竞争、非有限数值、归因正确性；**+ 巡检动作全链路、睡眠窗口闸门、改名后本体仍受保护** | 77 |
-| `test_qq_login_recovery.py` | **账密登录恢复专项**（C17 §3 T-01..T-15）：配置归一化/别名迁移、Credential 缓存与 401 单次重换、`PasswordLogin` 四类解析（`code==0` 非成功）、有条件重启判据、失败不追加重启、静默期（含**失败即强制落盘**）、就绪等待、闭环写回、凭据零泄漏、dry-run 零副作用、通知不误拉黑、IPC 契约、域边界 | 63 |
+| `test_qq_login_recovery.py` | **账密登录恢复专项**（C17 §3 T-01..T-15）：配置归一化/别名迁移、Credential 缓存与 401 单次重换、`PasswordLogin` 四类解析（`code==0` 非成功）、有条件重启判据、失败不追加重启、静默期（含**失败/成功均强制落盘**）、就绪等待、闭环写回、凭据零泄漏、dry-run 零副作用、通知不误拉黑、IPC 契约、域边界 | 64 |
 | `test_watchdog.sh`（`test_watchdog.py`） | 看门狗放行 / 白名单拒绝 / 过期拒绝 / 畸形忽略 / 失败记录 + **内核心跳守护**（心跳超时重启、reload 请求单一重启路径、冷却、非阻塞锁） | 75 |
 
 运行：`bash tests/run_all.sh`（Python 自检需要 `aiohttp`）
