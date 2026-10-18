@@ -3,7 +3,11 @@
 职责边界：本文件只做 AstrBot 适配（命令注册 / LLM 工具注册 / 钩子 / 生命周期），
 全部业务逻辑位于 `runtime.py` 与 `tools/llm_tools.py`。
 
-对应文档：B01 §main.py、B09（LLM 工具）、B15 §3.4（提示词注入）
+关键约束（P1）：`observe_message` 只记录"有人在说话"这一事实（`note_event`
+写入 `last_event_ts`），**不解析任何对话内容**。作息窗口的 `recent_talk` 判定
+完全依赖这个时间戳，因此本文件永远不需要理解用户在说什么。
+
+对应文档：B01 §main.py、B09（LLM 工具）、B15 §3.4（提示词注入）、B15 §7.5（作息窗口）
 """
 
 from __future__ import annotations
