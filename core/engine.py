@@ -343,6 +343,53 @@ class HealthEngine:
         return in_window(time.time() if now is None else now, start, end,
                          self._tz_offset_h())
 
+    def _max_defer_h(self) -> float:
+        """顺延上限（小时）。配置层已夹到 [1, 72]，这里只做取值。"""
+        return self._circadian_cfg()[3] or self.DEFAULT_MAX_DEFER_H
+
+    def _recent_talk(self, now: float) -> bool:
+        """最近 `quiet_minutes` 分钟内是否有人说过话。
+
+        `last_event_ts` 由适配层 `note_event()` 写入（带 10s 合并），因此
+        这里不需要新增任何适配层代码，也不需要解析任何对话内容。
+        """
+        raw = self.config.get("circadian")
+        quiet_min = 10.0
+        if isinstance(raw, dict):
+            try:
+                quiet_min = float(raw.get("quiet_minutes", quiet_min))
+            except (TypeError, ValueError):
+                quiet_min = 10.0
+        if quiet_min <= 0:
+            return False
+        last = self.state.get("last_event_ts")
+        if isinstance(last, bool) or not isinstance(last, (int, float)):
+            return False
+        age = now - float(last)
+        # 负数说明时钟被回拨过，不能据此判定"刚说过话"
+        return 0.0 <= age < quiet_min * 60.0
+
+    def _deferred_too_long(self, now: float) -> bool:
+        """顺延是否已超过 `max_defer_hours`（超过即无视窗口强制执行）。"""
+        since = self.lifecycle_state.deferred_since
+        if not since:
+            return False
+        return (now - float(since)) >= self._max_defer_h() * 3600.0
+
+    def _defer_sleep_reason(self, now: float, *, in_win: bool,
+                            recent_talk: bool) -> str:
+        """给"这次为什么没睡"一句运维能看懂的话。"""
+        if not in_win:
+            _, start, end, _ = self._circadian_cfg()
+            reopen = self._window_open_ts(now)
+            wait_min = max(0, int((reopen - now) / 60))
+            return (f"当前不在作息窗口（{start}-{end}），"
+                    f"约 {wait_min // 60} 小时 {wait_min % 60} 分后开启；本次睡眠已推迟")
+        if recent_talk:
+            return ("最近有人在对话，暂不打断；本次睡眠已推迟"
+                    "（顺延超过上限后将无视窗口强制入睡）")
+        return "作息窗口判定推迟本次睡眠"
+
     def _l1_threshold_h(self) -> float:
         """L1 的 `after_hours`，作为"困意开始可见"的门槛。
 
@@ -463,6 +510,48 @@ class HealthEngine:
                               detail=msg, actor=actor, trigger=trigger,
                               suppressed=True, reason="confirm_required")
             return False, msg
+
+        # ---- ④ 作息窗口闸门（M4） -------------------------------------- #
+        # 只有**自主**来源才受窗口约束：等级推进与硬上限顺延。人（管理员命令）
+        # 与定时任务（cron）是显式意图，不该被"现在是凌晨"驳回。
+        #
+        # 判据顺序不能换：
+        #   1. 在窗口内且最近没人说话  -> 直接放行
+        #   2. 顺延已超 max_defer_hours -> 无视窗口放行（30 天保证）
+        #   3. 其余                    -> 推迟
+        #
+        # 第 2 步必须排在 `recent_talk` 之前。否则"整夜都有人在聊天"会让
+        # recent_talk 永远为真，顺延上限被无限推后，"30 天必定真睡一次"就
+        # 被聊穿了——这正是 max_defer_hours 存在的理由。
+        if actor in ("lifecycle",) or trigger in ("level", "deadline"):
+            now = time.time()
+            in_win = self.in_asleep_window(now)
+            recent_talk = self._recent_talk(now)
+            deferred_too_long = self._deferred_too_long(now)
+
+            if not in_win or recent_talk:
+                if not deferred_too_long:
+                    detail = self._defer_sleep_reason(
+                        now, in_win=in_win, recent_talk=recent_talk)
+                    self.audit.append(
+                        kind="sleep.deferred", target=",".join(
+                            cfg.lifecycle.sleep_targets or []),
+                        detail=detail, actor=actor, trigger=trigger,
+                        suppressed=True,
+                        reason="recent_talk" if recent_talk else "outside_window")
+                    await self.notifier.push(
+                        f"[作息] {detail}", severity=Severity.INFO,
+                        target="lifecycle", status="deferred")
+                    return False, detail
+                # 顺延超限：放行，但把这件事说清楚，别让它悄悄发生。
+                logger.warning(
+                    f"[guardian] 睡眠顺延已超过 {self._max_defer_h():.0f} 小时，"
+                    f"无视作息窗口执行睡眠（{reason}）")
+                self.audit.append(
+                    kind="sleep.defer_override",
+                    target=",".join(cfg.lifecycle.sleep_targets or []),
+                    detail=f"顺延超过上限，无视窗口执行：{reason}",
+                    actor=actor, trigger=trigger)
 
         allow = cfg.action_allowlist
         raw_targets = list(cfg.lifecycle.sleep_targets or [])
