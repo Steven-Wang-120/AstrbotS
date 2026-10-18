@@ -18,7 +18,29 @@ import zipfile
 ROOT = os.path.dirname(os.path.abspath(__file__))
 PKG = "astrbot_plugin_guardian"
 SRC = ROOT  # 仓库根即插件根
-OUT = os.path.join(ROOT, f"{PKG}-0.6.0.zip")
+
+
+def _read_version() -> str:
+    """从 `metadata.yaml` 读版本号，避免与元数据脱节。
+
+    早先这里硬编码过 `-0.6.0.zip`，版本一升就打不出新包名，或者更糟——
+    打出来的包名和里面的 metadata 不一致。以 metadata.yaml 为唯一真相源。
+    """
+    path = os.path.join(ROOT, "metadata.yaml")
+    try:
+        with open(path, encoding="utf-8") as fp:
+            for line in fp:
+                key, sep, value = line.partition(":")
+                if sep and key.strip() == "version":
+                    return value.strip().strip("\"'")
+    except OSError:
+        pass
+    print("警告：未能从 metadata.yaml 读到 version，产物名退回 0.0.0")
+    return "0.0.0"
+
+
+VERSION = _read_version()
+OUT = os.path.join(ROOT, f"{PKG}-{VERSION}.zip")
 
 #: 仓库根上**不属于插件本体**的顶层目录（测试、部署、文档、VCS、缓存）。
 EXCLUDE_DIRS = {

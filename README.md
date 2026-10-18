@@ -5,7 +5,7 @@ AstrBot 双模式健康守护插件。面向 **Arch Linux + Docker Compose** 的
 生命周期自主睡眠与 ROS2 守护。
 
 - 插件名：`astrbot_plugin_guardian`
-- 版本：`0.6.0`
+- 版本：`0.7.0`
 - 要求：AstrBot `>= 4.5.7`
 - 依赖：`aiohttp`（AstrBot 通常已内置）
 - 支持平台：`aiocqhttp` / `qq_official` / `telegram` / `lark` / `dingtalk` / `discord`
@@ -52,7 +52,7 @@ AstrBot 双模式健康守护插件。面向 **Arch Linux + Docker Compose** 的
 
 **方式一：上传压缩包（推荐）**
 
-在仓库根执行 `python build_plugin_zip.py`，产出 `astrbot_plugin_guardian-0.6.0.zip`，
+在仓库根执行 `python build_plugin_zip.py`，产出 `astrbot_plugin_guardian-0.7.0.zip`，
 然后在 AstrBot WebUI → 插件 → 安装插件 → 上传文件。压缩包根目录是
 `astrbot_plugin_guardian/`，其下直接有 `metadata.yaml`，符合 AstrBot 的
 `inspect_plugin_archive()` 校验。
