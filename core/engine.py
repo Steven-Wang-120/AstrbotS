@@ -19,7 +19,7 @@ from . import registry  # noqa: F401  触发探针注册
 from .audit import AuditLog
 from .bus import EventBus
 from .config import GuardianConfig
-from .lifecycle import LifecyclePolicy, LifecycleState
+from .lifecycle import LifecyclePolicy, LifecycleState, drowsy_visible
 from .log import logger
 from .models import (
     ActionSpec,
@@ -34,6 +34,7 @@ from .models import (
 from .policy import PolicyEngine
 from .safety import SafetyGuard
 from .state import StateStore
+from .timewindow import in_window, minutes_until_window
 
 MAX_INCIDENTS_KEPT = 200
 
@@ -299,6 +300,73 @@ class HealthEngine:
     # ================================================================== #
     # 生命周期
     # ================================================================== #
+    #: 顺延上限的默认值，仅在配置缺失时兜底（配置层已夹到 [1, 72]）。
+    DEFAULT_MAX_DEFER_H = 12.0
+
+    def _circadian_cfg(self) -> tuple[bool, str, str, float]:
+        """\u53d6 (enabled, start, end, max_defer_h)。配置段缺失一律视为禁用。"""
+        raw = self.config.get("circadian")
+        if not isinstance(raw, dict):
+            return False, "02:00", "07:00", self.DEFAULT_MAX_DEFER_H
+        try:
+            max_defer = float(raw.get("max_defer_hours", self.DEFAULT_MAX_DEFER_H))
+        except (TypeError, ValueError):
+            max_defer = self.DEFAULT_MAX_DEFER_H
+        return (
+            bool(raw.get("enabled", False)),
+            str(raw.get("asleep_start", "02:00")),
+            str(raw.get("asleep_end", "07:00")),
+            max_defer,
+        )
+
+    def _tz_offset_h(self) -> float:
+        """本地时间相对 UTC 的偏移（小时）。
+
+        只读取 `env_platform` 探针落库的值：进程内的 `time.timezone` 在容器里
+        经常是 0（镜像没设 `TZ`），用它算窗口会把 02:00 当成 UTC 02:00。
+        探针拿不到时回退 +8（本项目默认部署时区），而不是不判——不判等于
+        窗口永不生效，比"按东八区算"更糟。
+        """
+        value = self.state.get("env.tz_offset_h")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 8.0
+        offset = float(value)
+        if not -14.0 <= offset <= 14.0:
+            return 8.0
+        return offset
+
+    def in_asleep_window(self, now: float | None = None) -> bool:
+        """此刻是否**允许**入睡。禁用或配置非法时为 True（不设限）。"""
+        enabled, start, end, _ = self._circadian_cfg()
+        if not enabled:
+            return True
+        return in_window(time.time() if now is None else now, start, end,
+                         self._tz_offset_h())
+
+    def _l1_threshold_h(self) -> float:
+        """L1 的 `after_hours`，作为"困意开始可见"的门槛。
+
+        `lifecycle.levels` 允许用户自定义，所以不能硬编码 168。取"最低一个
+        after_hours > 0 的等级"阈值；若用户只配了 L0（或全部为 0），退回 0，
+        此时只要等级进入 arm_sleep 就算困——那是用户自己配出来的语义。
+        """
+        best: float | None = None
+        for spec in (self.lifecycle_policy.levels or []):
+            hours = float(getattr(spec, "after_hours", 0.0) or 0.0)
+            if hours > 0 and (best is None or hours < best):
+                best = hours
+        return 0.0 if best is None else best
+
+    def _window_open_ts(self, now: float) -> float:
+        """下一次窗口开启的时刻（已在窗口内则返回 now）。"""
+        enabled, start, end, _ = self._circadian_cfg()
+        if not enabled:
+            return now
+        lead = minutes_until_window(now, start, end, self._tz_offset_h())
+        if lead <= 0:
+            return now
+        return now + lead * 60.0
+
     async def _lifecycle_tick(self, trigger: str) -> None:
         res = self._last_results.get("uptime:system")
         if res is None or res.status != Status.OK:
@@ -313,6 +381,30 @@ class HealthEngine:
         uptime_h = float(res.metrics.get("uptime_hours", 0.0) or 0.0)
         now = time.time()
         decision = self.lifecycle_policy.evaluate(uptime_h, self.lifecycle_state, now)
+
+        # ---- 困意可见性（M3） ------------------------------------------ #
+        # `drowsy_visible` 只决定"要不要把困意说出来/注入提示词"，**不参与**
+        # `level_index` 与 `sleep_armed` 的计算——那两项永远只由 uptime 决定，
+        # 窗口无权改写。这是"窗口是闸门不是触发器"在代码里的落点。
+        drowsy = drowsy_visible(
+            decision["action"], self.in_asleep_window(now), uptime_h,
+            self._l1_threshold_h())
+        if not drowsy and decision["inject_prompt"]:
+            # 想睡但不在窗口内：把提示词压住，并记下"顺延从何时开始"。
+            # 提示词已经在 evaluate() 里就消费掉了冷却，所以这里清了之后
+            # 下一轮不会立刻又冒出来（注入冷却由 last_inject_at 掌管）。
+            self.lifecycle_state.suppressed_until = self._window_open_ts(now)
+            if not self.lifecycle_state.deferred_since:
+                self.lifecycle_state.deferred_since = now
+            self.audit.append(
+                kind="lifecycle.suppressed", target=decision["level"].id,
+                detail=(f"{decision['reason']} | 不在作息窗口内，"
+                        "困意注入已推迟至窗口开启"),
+                trigger=trigger, suppressed=True, reason="circadian_window")
+            decision = dict(decision, inject_prompt=None)
+        elif drowsy:
+            # 回到窗口内：顺延计时结束（真正的清零在睡过一觉之后）。
+            self.lifecycle_state.suppressed_until = 0.0
 
         if decision["inject_prompt"]:
             self.state.set("lifecycle.inject_prompt", decision["inject_prompt"])

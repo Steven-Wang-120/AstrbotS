@@ -46,6 +46,13 @@ class LifecycleState:
     sleep_armed: bool = False
     forced_at: float = 0.0
     clock_skew_warned: bool = False
+    #: 首次"想睡但被窗口挡住"的时刻。用于 `max_defer_hours` 顺延上限：
+    #: 从这一刻起算，超过上限就无视窗口强制入睡。0 表示当前没有顺延。
+    deferred_since: float = 0.0
+    #: 困意注入被窗口抑制到此刻（回落到窗口开启时刻，或窗口结束）。
+    #: **只影响提示词注入**，不影响 `level_index` / `sleep_armed`——等级与
+    #: 武装状态永远由 uptime 决定，窗口无权改写它们。
+    suppressed_until: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -59,6 +66,8 @@ class LifecycleState:
             "sleep_armed": self.sleep_armed,
             "forced_at": self.forced_at,
             "clock_skew_warned": self.clock_skew_warned,
+            "deferred_since": self.deferred_since,
+            "suppressed_until": self.suppressed_until,
         }
 
     @classmethod
@@ -205,6 +214,9 @@ class LifecyclePolicy:
         st.level_index = 0
         st.level_id = self.levels[0].id
         st.level_name = self.levels[0].name
+        # 睡过一觉，顺延与抑制都结清了：下一次"想睡"重新从零开始计时。
+        st.deferred_since = 0.0
+        st.suppressed_until = 0.0
 
     def describe(self, st: LifecycleState) -> str:
         nxt = self.next_level(st.level_index)
@@ -222,6 +234,31 @@ class LifecyclePolicy:
             f"距硬上限 {self.remaining_to_deadline(st.uptime_hours):.1f}h | "
             f"武装睡眠 {'是' if st.sleep_armed else '否'}{forced_txt}"
         )
+
+
+def drowsy_visible(level_action: str, in_asleep_window: bool,
+                   uptime_hours: float, l1_threshold: float) -> bool:
+    """Bot 此刻**该不该表现出困意**（纯函数，无 IO）。
+
+    这是"人生理节律"的全部对外可见部分，刻意做得极窄：用户明确要求
+    「生物钟现阶段可以不表现出来，或者只有 asleep 窗口期间 bot 才会
+    感觉有困意想去睡觉」，以及「每天内语气先不变化，粒度太小」。
+
+    因此三条同时成立才给真：
+
+    1. 等级本身已经进入"想睡"区（`action` 为 `arm_sleep` / `force_sleep`）——
+       困意是 uptime 的函数，不是时钟的函数；
+    2. 此刻确实落在作息窗口内——窗口是唯一让它"说出困"的许可；
+    3. 已越过 L1 阈值——避免刚睡醒就喊困。
+
+    第 1 条是关键：**窗口本身永远不能让 Bot 变困**。否则一到 02:00 就算
+    刚重启完 3 分钟也会开始说困，那是定时任务，不是生物钟。
+    """
+    if level_action not in ("arm_sleep", "force_sleep"):
+        return False
+    if not in_asleep_window:
+        return False
+    return float(uptime_hours) >= float(l1_threshold)
 
 
 def build_policy(cfg) -> LifecyclePolicy:
