@@ -116,6 +116,7 @@ class HealthEngine:
                 # 独立 QQ/局部巡检不能抹掉其他探针的最新健康快照。
                 self._last_results.update(current)
             self._last_run_ts = time.time()
+            self._persist_tz_offset()
 
             findings = self.policy.evaluate(results)
             incidents = await self._handle_findings(findings, trigger)
@@ -478,6 +479,44 @@ class HealthEngine:
 
     def recent_incidents(self, limit: int = 10) -> list[Incident]:
         return list(reversed(self._incidents[-limit:]))
+
+    def _persist_tz_offset(self) -> None:
+        """把本地时区偏移落盘到 `env.tz_offset_h`。
+
+        **为什么必须落盘**：`llm_injection()` 是每轮对话都走的最热路径，不能在那里
+        调探针（它有 5 分钟缓存，但仍然要读 `/proc`、`platform`、`zoneinfo`）。
+        而作息窗口判定（`core/timewindow.py`）和"现在几点"的描述（`core/timefmt.py`）
+        都需要这个值，且每轮都要。
+
+        探针没跑过时（例如只有 QQ 局部巡检）保留上一次的值，不覆盖成 0——
+        `0` 是"UTC"这个**有意义**的合法值，不能拿它兼任"未知"。
+        """
+        res = self._last_results.get("env_platform")
+        metrics = getattr(res, "metrics", None) if res is not None else None
+        if not isinstance(metrics, dict):
+            # 正式键是 `<probe>:<target>`，探针的 target 恒为 "env"；
+            # 但"按 probe 名直接取"在别处（如 `_lifecycle_tick` 对
+            # `uptime:system`）也是惯例，两种都认，避免键名一变就静默失效。
+            for key, candidate in self._last_results.items():
+                if not key.startswith("env_platform"):
+                    continue
+                candidate_metrics = getattr(candidate, "metrics", None)
+                if isinstance(candidate_metrics, dict) and candidate_metrics.get("tz_offset_h") is not None:
+                    metrics = candidate_metrics
+                    break
+        if not isinstance(metrics, dict):
+            return
+        value = metrics.get("tz_offset_h")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return
+        try:
+            offset = float(value)
+        except (TypeError, ValueError):
+            return
+        if not -14.0 <= offset <= 14.0:
+            return
+        if self.state.get("env.tz_offset_h") != offset:
+            self.state.set("env.tz_offset_h", offset)
 
     def snapshot(self) -> dict[str, Any]:
         return {

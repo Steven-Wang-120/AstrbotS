@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import time
+from datetime import datetime
 from typing import Any
 
 from ..core.models import Severity, Status
@@ -65,6 +67,114 @@ def _cpu_count() -> int:
 _CACHE: dict[str, Any] = {"at": 0.0, "data": {}}
 
 
+def detect_tz_offset_h(env: dict[str, str] | None = None) -> float:
+    """返回本地时区相对 UTC 的偏移（小时，东正西负），例如东八区 -> ``8.0``。
+
+    **原来的写法是错的**：``round(-time.timezone / 3600, 1)``。
+    两个问题叠在一起：
+
+    1. ``time.timezone`` 是 **standard time** 偏移，不含夏令时；
+    2. 更要命的是容器里没设 ``TZ`` 时它**直接给 0**，与真实本地时区无关。
+       东八区的镜像如果漏了 ``TZ``，作息窗口会整体偏移 8 小时——这是本模块
+       最危险的静默失败点。
+
+    所以按可靠性从高到低依次尝试：
+
+    1. ``TZ`` 环境变量（``Asia/Shanghai`` 这类 IANA 名，或 ``CST-8`` 这类 POSIX 串）
+    2. ``datetime.now().astimezone().utcoffset()`` —— 跟随进程的实际本地时区
+    3. ``-time.altzone / 3600``（夏令时版本）
+    4. ``-time.timezone / 3600``（标准时版本，最后的兜底）
+
+    第 2 步在绝大多数容器里已经能给出正确答案（glibc 会读 ``/etc/localtime``），
+    第 1 步只是为了在 ``TZ`` 显式设置时优先信任运维的意图。
+    """
+    env = os.environ if env is None else env
+
+    # ① TZ 显式设置：IANA 名优先（zoneinfo 能正确处理该地区的夏令时历史）
+    raw_tz = str(env.get("TZ", "") or "").strip()
+    if raw_tz:
+        offset = _offset_from_tz_name(raw_tz)
+        if offset is None:
+            offset = _offset_from_posix_tz(raw_tz)
+        if offset is not None:
+            return offset
+        # TZ 写了但解不出来：**不要**偷偷回落到"进程时区"——那会把一个明确的
+        # 配置错误伪装成正确答案。交给下面两步，但记住这是一次降级。
+    # ② 进程实际本地时区（最贴合"这台机器认为现在几点"）
+    try:
+        offset = datetime.now().astimezone().utcoffset()
+        if offset is not None:
+            return round(offset.total_seconds() / 3600.0, 2)
+    except (OSError, OverflowError, ValueError):
+        pass
+
+    # ③ 夏令时版本，④ 标准时版本
+    for value in (getattr(time, "altzone", None), getattr(time, "timezone", None)):
+        if value is None:
+            continue
+        try:
+            return round(-float(value) / 3600.0, 2)
+        except (TypeError, ValueError):
+            continue
+
+    return 0.0
+
+
+def _offset_from_tz_name(name: str) -> float | None:
+    """用 ``zoneinfo`` 解析 IANA 时区名；不是 IANA 名或不可用时返回 None。"""
+    # 只有形如 "Area/City" 或 "UTC"/"GMT" 的才值得交给 zoneinfo，
+    # 否则会把 "CST-8" 这类 POSIX 串当文件路径去查，纯属浪费。
+    if "/" not in name and name.upper() not in {"UTC", "GMT", "UCT", "Z"}:
+        return None
+    try:
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    except ImportError:
+        return None
+    try:
+        offset = datetime.now(ZoneInfo(name)).utcoffset()
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        # **注意**：Windows 与精简镜像可能没有 tzdata，此时所有 IANA 名都会
+        # 落到这里。上层会继续用 `astimezone()` 兜底，结果通常仍然正确
+        # （glibc/Windows 自己知道本地时区），只是"TZ 优先"这一层失效了。
+        # 不要在这里 raise：时区拿不到是降级，不是故障。
+        return None
+    if offset is None:
+        return None
+    return round(offset.total_seconds() / 3600.0, 2)
+
+def _offset_from_posix_tz(value: str) -> float | None:
+    """解析 POSIX 风格 ``CST-8`` / ``UTC0``；POSIX 的符号与直觉相反。
+
+    POSIX 里 ``CST-8`` 表示"比 UTC **快** 8 小时"，也就是东八区 ``+8``。
+    即 **偏移 = 数字部分的相反数**：``-8`` -> ``+8``，``+5`` -> ``-5``。
+
+    只接受"字母名 + 可选数字"，且字母名长度 3..5（``UTC``/``GMT`` 这类特殊名另判）。
+    带夏令时规则的形态（``EST5EDT``、``CST-8CDT``）这里**解不了**——那需要完整
+    的 tzdata 规则，交给第 ② 步的 ``astimezone()`` 更可靠，所以这里返回 None。
+    """
+    if value.upper() in {"UTC", "GMT", "UCT", "Z"}:
+        return 0.0
+    match = re.fullmatch(r"([A-Za-z]{3,5})([+-]?\d{1,2}(?::\d{2})?(?::\d{2})?)", value)
+    if not match:
+        return None
+    body = match.group(2)
+    # POSIX 符号是反的：`CST-8` 的 `-8` 表示"比 UTC 快 8 小时" = +8。
+    sign = 1.0 if body[0] == "-" else -1.0
+    if body[0] in "+-":
+        body = body[1:]
+    chunks = body.split(":")
+    try:
+        hours = int(chunks[0])
+        minutes = int(chunks[1]) if len(chunks) > 1 else 0
+    except ValueError:
+        return None
+    if not 0 <= hours <= 24 or not 0 <= minutes < 60:
+        return None
+    total = sign * (hours + minutes / 60.0)
+    # `-0.0` 会一路传到状态文本里显示成 "-0"，归一化成 +0.0
+    return round(total, 2) + 0.0
+
+
 def collect_env() -> dict[str, Any]:
     """采集一次环境信息（带进程内 5 分钟缓存）。任何字段失败都是空值，不抛。"""
     now = time.time()
@@ -76,10 +186,7 @@ def collect_env() -> dict[str, Any]:
         machine = platform.machine() if platform is not None else ""
     except Exception:  # noqa: BLE001
         machine = ""
-    try:
-        tz_offset_h = round(-time.timezone / 3600, 1)
-    except Exception:  # noqa: BLE001
-        tz_offset_h = 0.0
+    tz_offset_h = detect_tz_offset_h()
 
     data = {
         "os": canonical_os(info.get("os") or (platform.system() if platform else "")),
