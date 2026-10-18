@@ -3,6 +3,7 @@
 from . import (
     container_memory,
     docker_probes,
+    env_platform,
     qq_login,
     ros2_doctor,
     ros2_nodes,
@@ -13,6 +14,7 @@ from . import (
 __all__ = [
     "container_memory",
     "docker_probes",
+    "env_platform",
     "qq_login",
     "ros2_doctor",
     "ros2_nodes",

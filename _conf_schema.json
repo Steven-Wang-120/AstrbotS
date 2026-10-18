@@ -31,11 +31,6 @@
     "default": true,
     "hint": "首次部署建议保持开启，确认无误后再关闭"
   },
-  "os_hint": {
-    "description": "目标系统提示（仅用于诊断文案）",
-    "type": "string",
-    "default": "arch"
-  },
   "docker": {
     "description": "Docker 连接配置",
     "type": "object",

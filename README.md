@@ -31,7 +31,8 @@ AstrBot 双模式健康守护插件。面向 **Arch Linux + Docker Compose** 的
 | 生命周期自主睡眠 | 按容器运行时长分级（阈值前端可配），每级向 Bot 注入不同提示词引导其自主决定休息；30 天硬上限强制真睡眠 |
 | LLM 工具 | 9 个工具供 Bot 自主调用（健康报告、巡检、诊断、事件、睡眠、重启、切模式 / 档位） |
 | 通知 | 推送到指定会话，限流 + 去重 + 档位静默 + 失效 UMO 跳过 |
-| 安全护栏 | 白名单 / 冷却 / 每小时熔断 / dry-run / 受保护容器 / 参数规范化 / 连续失败降级 |
+| 安全护栏 | 白名单 / 冷却 / 每小时熔断 / 受保护容器 / 参数规范化 / 连续失败降级 |
+| 运行环境自述 | `env_platform` 探针从宿主机侧读取系统 / 内核 / 架构 / 内存 / 时区，无需手填 |
 
 ### 自主触发铁律
 
@@ -98,7 +99,24 @@ AstrBot 通常已内置；缺失时会按 `requirements.txt` 自动安装。
 > 会自动跟随 `containers.*`，**改名时不需要改这两项**。
 > `safety.protected_containers` 只填**额外**要保护的容器——本体始终受保护，不用重复写。
 
-### 3.1 账密登录恢复
+**不需要填的东西**：运行环境（系统 / 内核 / 架构 / 内存 / 时区）由 `env_platform`
+探针从宿主机侧采集，命令 `/guardian env` 或启动日志里可直接看到，没有需要手填的
+「目标系统」输入框。
+
+### 3.1 首次部署建议
+
+1. 先把 `containers.*` / `containers.managed` 填对，`/guardian safety` 里不应再有
+   「白名单为空」告警。
+2. **保持 `dry_run: true`（默认）观察若干天**：日志里会出现 `[dry-run] 将...`，
+   通知与审计照常，但不会有任何真实动作。
+3. 确认巡检结论正确后关闭 `dry_run`。若还想再稳一轮，可临时用
+   `profile=maintenance` 跑一次 `/guardian check`。
+4. 本体自重启另需 `safety.allow_self_restart: true` +
+   `safety.self_restart_strategy: "watchdog"` + 看门狗已运行（见 §7）。
+5. `lifecycle.levels` 决定分级阈值与注入提示词，可按需调整
+   （默认 168h / 360h / 600h / 720h，720h = 30 天硬上限）。
+
+### 3.2 账密登录恢复
 
 QQ 掉线后如果会话已过期，`restart_container` 重启多少次都回不来。填下面四项即可让插件
 在「重启 → 等待就绪 → 账密登录 → 复核写回」的阶梯里自动补登录。
@@ -126,15 +144,6 @@ QQ 掉线后如果会话已过期，`restart_container` 重启多少次都回不
 > （`qq.login_new_device`）。三类都**不会**追加重启，且失败后 6 小时内不再尝试账密。
 > QQ 离线时插件**不发 QQ 通知**（发了必失败，还可能把管理员 UMO 拉黑），改走
 > `/api/plug/astrbot_plugin_guardian/login` 登录状态页 + 落盘 `last_login_error.txt`。
-
-### 3.2 首次部署建议
-
-1. 保持 `dry_run: true`（默认）观察若干天，日志中会出现 `[dry-run] 将...`。
-2. 确认巡检结论正确后，再关闭 `dry_run`。
-3. 若要启用本体自重启，需同时：`safety.allow_self_restart: true` +
-   `safety.self_restart_strategy: "watchdog"` + 看门狗已运行（见 §7）。
-4. `lifecycle.levels` 决定分级阈值与注入提示词，可按需调整
-   （默认 168h / 360h / 600h / 720h，720h = 30 天硬上限）。
 
 ### 3.3 生命周期等级默认表
 
@@ -283,8 +292,10 @@ astrbot_plugin_guardian/        ← 仓库根 = 插件根
 **Q：改了容器名之后巡检报「目标不在白名单」？**
 同步修改 `containers.astrbot` / `containers.napcat` 和 `containers.managed`。
 
-**Q：`dry_run` 打开时 30 天保证还会执行吗？**
-不会，会降级为「强制告警」，不会真正重启。
+**Q：想先「只看不动手」试跑一段时间怎么办？**
+保持 `dry_run: true`（默认）观察若干天，日志中会出现 `[dry-run] 将...`；
+确认巡检结论正确后再关闭。若只想暂停周期动作、但仍要通知，可临时把 `profile`
+设为 `maintenance`。
 
 ---
 
@@ -327,7 +338,7 @@ ruff check .
 - 不做 WebUI 可视化面板（命令 + 通知 + 状态文件承载）。
 - 不提供任意 shell 执行能力（安全红线）。
 - NapCat 若需人工扫码，重登会失败并升级为 FATAL 通知。
-- `dry_run=true` 时 30 天保证降级为「强制告警」，不会真正重启。
+- 环境指纹是**本机（容器内**）视角：内存/磁盘反映的是 AstrBot 容器，不是宿主机总量。
 
 ---
 

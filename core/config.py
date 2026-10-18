@@ -75,7 +75,6 @@ DEFAULTS: dict[str, Any] = {
     "profile": "normal",
     "check_interval": 60,
     "dry_run": True,
-    "os_hint": "arch",
     "docker": {
         "socket_path": "/var/run/docker.sock",
         "api_version": "v1.44",
@@ -433,6 +432,17 @@ class GuardianConfig:
         """校验并就地修正非法配置。返回问题列表（空表示全部合法）。"""
         issues: list[str] = []
         raw = self.raw
+
+        # ---- 退役键 ---------------------------------------------------- #
+        # `os_hint` 曾出现在前端配置面：环境改由 `env_platform` 探针从宿主机侧
+        # 采集后，手填值只会与真实镜像基底冲突，误导诊断。
+        # 必须**删键**（而不是留着不用），否则 WebUI 下次保存会把它写回来；
+        # 同时给出可见告警，避免"开关消失了但没人知道"。
+        if "os_hint" in raw:
+            raw.pop("os_hint", None)
+            issues.append(
+                "os_hint 已退役并移除（系统信息改由 env_platform 探针"
+                "从宿主机侧采集，无需再手填）")
 
         if raw.get("mode") not in VALID_MODES:
             issues.append(f"mode={raw.get('mode')!r} 非法，回退 server")

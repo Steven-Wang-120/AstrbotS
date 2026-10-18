@@ -56,6 +56,7 @@ PLUGIN_VERSION = "0.6.0"
 
 HELP_TEXT = """== 守护系统 Guardian ==
 /guardian status                 健康快照（含运行时长与生命周期等级）
+/guardian env                    运行环境（系统/内核/架构/内存，宿主机侧采集）
 /guardian check [all|containers|qq|ros2]   立即巡检
 /guardian level                  生命周期等级详情
 /guardian sleep [分钟] [原因]    立即执行一次真睡眠（管理员）
@@ -202,6 +203,24 @@ class GuardianPlugin(Star):
             return HELP_TEXT
         if sub == "status":
             return await rt.status_text()
+        if sub == "env":
+            # 运行环境指纹：系统 / 内核 / 架构 / 内存 / 时区。
+            # 取代原先前端手填的 `os_hint`——值来自宿主机侧采集，不是用户输入。
+            info = await rt.env_info()
+            if not info:
+                return "环境信息暂不可用（采集失败）。"
+            return "\n".join([
+                "== 运行环境 ==",
+                f"系统: {info.get('distro') or info.get('os') or 'unknown'}",
+                f"发行版 ID: {info.get('os_id') or '(无)'}",
+                f"内核: {info.get('kernel') or '(未知)'}",
+                f"架构: {info.get('arch') or '(未知)'}"
+                f" | CPU: {info.get('cpu_count') or '?'} 核"
+                f" | 内存: {info.get('mem_total_mb') or 0:.0f}MB",
+                f"Python: {info.get('python') or '?'}"
+                f" | 时区偏移: {info.get('tz_offset_h')}h",
+                f"来源: {info.get('source') or 'unknown'}",
+            ])
         if sub == "check":
             scope = args[1].lower() if len(args) > 1 else "all"
             return await llm_tools.run_check(rt, scope)

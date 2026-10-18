@@ -141,11 +141,20 @@ def build_handlers(kernel: Any) -> dict[str, Handler]:
     async def h_runtime_flags(p: dict) -> dict:
         """适配层做 L-D 二次确认所需的权威开关（**必须来自内核**）。
 
-        适配层不能拿自己那份配置副本判断 `dry_run`：两份配置一旦漂移，
-        适配层会在"自己以为 dry-run"时传 `bypass_confirm=True`，
-        而内核其实已经关掉 dry-run —— 那就是一次无确认的真睡眠。
+        适配层不能拿自己那份配置副本判断开关状态：两份配置一旦漂移，
+        适配层会在"自己以为关着"时放行，而内核其实已经打开 —— 那就是一次
+        无确认的真睡眠。
         """
         return _jsonable(kernel.runtime_flags())
+
+    async def h_env_info(p: dict) -> dict:
+        """运行环境指纹（系统 / 内核 / 架构 / 内存 / 时区）。
+
+        取代了原先前端手填的 `os_hint`：环境信息由宿主机侧采集，适配层只负责
+        展示。放成 IPC 方法是为了 `kernel.mode=ipc` 时也能从**内核进程**读取
+        —— 内核与适配层同容器，值一致，但口径只有一个来源。
+        """
+        return _jsonable(kernel.env_info() or {})
 
     async def h_sleep_armed(p: dict) -> bool:
         return bool(kernel.sleep_armed())
@@ -235,6 +244,7 @@ def build_handlers(kernel: Any) -> dict[str, Handler]:
         "injection": h_injection,
         "status_context": h_status_context,
         "runtime_flags": h_runtime_flags,
+        "env_info": h_env_info,
         "sleep_armed": h_sleep_armed,
         "run_check": h_run_check,
         "request_sleep": h_request_sleep,
@@ -263,6 +273,7 @@ METHOD_NAMES = frozenset({
     "health_report", "lifecycle_status", "status_text", "lifecycle_text",
     "jobs_text", "safety_warnings", "allowlist", "diagnose", "list_incidents",
     "level_prompt", "injection", "status_context", "runtime_flags",
+    "env_info",
     "sleep_armed", "run_check", "request_sleep", "restart_container",
     "request_qq_login", "qq_login_status",
     "start_container", "set_mode", "set_profile", "note_event",

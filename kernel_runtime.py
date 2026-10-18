@@ -484,6 +484,13 @@ class GuardianKernel:
     def lifecycle_text(self) -> str:
         return self.engine.lifecycle_text()
 
+    def env_info(self) -> dict[str, Any]:
+        """运行环境指纹（系统 / 内核 / 架构 / 内存 / 时区）。
+
+        取代前端手填的 `os_hint`：值来自宿主机侧采集，而不是运维的输入。
+        """
+        return self.engine.env_info()
+
     def health_report(self, scope: str = "all") -> str:
         snap = self.engine.snapshot()
         lines = [

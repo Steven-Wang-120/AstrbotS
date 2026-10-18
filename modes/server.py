@@ -3,6 +3,8 @@
 对应文档：B00 §4、B04、B05、B06
 
 默认面向 Arch Linux + Docker 双容器（napcat / astrbot）。
+运行环境（系统 / 内核 / 架构 / 内存）由 `env_platform` 探针从宿主机侧读取，
+不在前端手填。
 """
 
 from __future__ import annotations
@@ -19,11 +21,15 @@ class ServerMode(ModeAdapter):
         "container_memory",
         "qq_login",
         "self_health",
+        "env_platform",
         "uptime",
     ]
 
     def describe(self) -> str:
-        os_hint = getattr(self.config, "os_hint", "arch")
+        from ..probes.env_platform import collect_env, env_summary
+
         managed = ", ".join(sorted(self.config.action_allowlist)) or "(空)"
-        return (f"{self.display}(server) | 目标系统 {os_hint} | Docker 双容器 | "
+        # 环境指纹取自宿主机真实值，不再由前端手填：手填值一旦与镜像实际基底
+        # 不符，就会变成一条主动误导运维的"文档"。
+        return (f"{self.display}(server) | 环境 {env_summary(collect_env())} | "
                 f"白名单: {managed} | 探针: {', '.join(self.probe_names)}")

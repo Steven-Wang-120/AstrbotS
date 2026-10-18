@@ -380,6 +380,13 @@ class GuardianAdapter:
     async def lifecycle_text(self) -> str:
         return str(await self._call("lifecycle_text"))
 
+    async def env_info(self) -> dict[str, Any]:
+        """运行环境指纹（系统 / 内核 / 架构 / 内存 / 时区），经内核取。
+
+        前端不再有 `os_hint` 输入框：环境由宿主机侧采集，适配层只展示。
+        """
+        return dict(await self._call("env_info") or {})
+
     async def lifecycle_status_text(self) -> str:
         return str(await self._call("lifecycle_status"))
 

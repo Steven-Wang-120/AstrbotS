@@ -16,6 +16,7 @@ class Ros2Mode(ModeAdapter):
         "ros2_nodes",
         "ros2_topics",
         "ros2_doctor",
+        "env_platform",
         "uptime",
     ]
 

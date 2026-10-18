@@ -492,6 +492,23 @@ class HealthEngine:
             "incident_count": len(self._incidents),
         }
 
+    def env_info(self) -> dict[str, Any]:
+        """当前巡检采集到的运行环境指纹（`env_platform` 探针的 metrics）。
+
+        没有就跑一次采集：状态快照/诊断报告不应该因为"还没巡检过"而缺一块
+        —— 这正是前端不再需要用户手填 `os_hint` 的前提。
+        """
+        res = self._last_results.get("env_platform")
+        if res is not None and res.metrics:
+            return dict(res.metrics)
+        try:
+            from ..probes.env_platform import collect_env
+
+            return collect_env()
+        except Exception:  # noqa: BLE001 —— 环境信息缺失不能拖垮状态输出
+            logger.debug("[guardian] 环境指纹采集失败", exc_info=True)
+            return {}
+
     def status_text(self, scheduler=None) -> str:
         cfg = self.config
         lines: list[str] = []
