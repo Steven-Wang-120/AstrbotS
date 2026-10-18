@@ -137,6 +137,12 @@ DEFAULTS: dict[str, Any] = {
     },
     "schedule": {
         "daily_restart_enabled": False,
+        # 前端只暴露这两个"人能读"的字段；cron 由 `_sync_daily_restart_cron()`
+        # 派生。5 字段 cron 对新手是纯门槛（`0 4 * * *` 到底几点？），而本插件
+        # 的定时重启只可能是"每天 HH:MM"，根本用不上 dom/month/dow。
+        "daily_restart_time": "04:00",
+        "daily_restart_weekdays": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+        # 派生/兼容字段：不进前端。老配置里手写的 cron 仍被尊重（见 sync 逻辑）。
         "daily_restart_cron": "0 4 * * *",
         "daily_restart_targets": [],
     },
@@ -248,6 +254,27 @@ RETIRED_KEYS: tuple[tuple[str, str], ...] = (
 #: 保留常量只为迁移逻辑可读；它本身不再参与任何授权判定。
 LEGACY_ALLOWED_CONTAINERS = ("safety", "allowed_containers")
 
+#: 星期缩写 -> cron 的 day-of-week（0=周日）。
+#: 顺序即前端展示顺序（周一到周日），与 cron 数值解耦。
+_WEEKDAY_INDEX: dict[str, int] = {
+    "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6, "sun": 0,
+}
+
+
+def _parse_hhmm(value: str) -> tuple[int, int] | None:
+    """解析 `HH:MM` / `H:MM`，返回 (hour, minute)；非法返回 None。"""
+    text = (value or "").strip()
+    if ":" not in text:
+        return None
+    hh, _, mm = text.partition(":")
+    try:
+        hour, minute = int(hh), int(mm.strip())
+    except ValueError:
+        return None
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None
+    return hour, minute
+
 #: B00 §7 用 `sidecar` 描述 D1-a 的部署形态，B16 §9 用 `ipc` 描述适配层的连接方式。
 #: 两者指的是同一件事（"内核不在本进程里"），这里统一到 `ipc` 作为内部规范值，
 #: `sidecar` 作为等价别名保留——避免文档里写的值在配置里填不进去。
@@ -341,7 +368,14 @@ class GuardianConfig:
     """AstrBotConfig -> 只读结构化视图。"""
 
     def __init__(self, raw: dict | None = None, *, data_dir: str = "") -> None:
-        self.raw: dict[str, Any] = deep_merge(DEFAULTS, raw or {})
+        provided = raw or {}
+        # `deep_merge` 会把 DEFAULTS 里的键全部补齐，之后就分不清"用户填了"
+        # 和"默认值兜底"了。退役键迁移与定时重启的 legacy-cron 兼容都必须
+        # 看**用户原本给了什么**，所以在这里先把原始 section 的键记下来。
+        sched_in = provided.get("schedule")
+        self._provided_schedule_keys: set[str] = (
+            set(sched_in.keys()) if isinstance(sched_in, dict) else set())
+        self.raw: dict[str, Any] = deep_merge(DEFAULTS, provided)
         self.data_dir = data_dir
         self._d = _to_attr(self.raw)
         self._issues: list[str] = []
@@ -483,6 +517,63 @@ class GuardianConfig:
             "safety.allowed_containers 已退役并移除（与 containers.managed 语义"
             f"重复）；原值 {names} 已并入 containers.managed"
             + (f"（新增 {added}）" if added else "（无新增）"))
+
+    def _sync_daily_restart_cron(self, sched: dict, issues: list[str]) -> None:
+        """把前端友好的 `daily_restart_time` + `daily_restart_weekdays` 编译成 cron。
+
+        前端不再要求用户写 5 字段 cron（那是本插件用不到的通用语法：定时重启
+        只可能是"每周某几天 HH:MM"）。规则：
+
+        - 时刻：`HH:MM`，非法则回退默认 04:00 并记 issue。
+        - 星期：`mon`..`sun` 子集，空 = 每天；未知值剔除。
+        - **兼容老配置**：只有当两个新字段都还不存在、而 `daily_restart_cron`
+          是手写的非默认值时，才原样尊重它（避免升级把用户的 `30 3 * * 1`
+          悄悄改回每天 4 点）。一旦新字段出现，就以新字段为准。
+        """
+        default_cron = DEFAULTS["schedule"]["daily_restart_cron"]
+        has_time = "daily_restart_time" in self._provided_schedule_keys
+        has_days = "daily_restart_weekdays" in self._provided_schedule_keys
+        legacy_cron = str(sched.get("daily_restart_cron") or "").strip()
+        # 注意判断依据是"用户**原始**配置里有没有这两个键"，不是 sched 里有没有——
+        # sched 已被 DEFAULTS 补齐，新字段永远存在。
+        if not has_time and not has_days and legacy_cron and legacy_cron != default_cron:
+            issues.append(
+                f"schedule.daily_restart_cron={legacy_cron!r} 沿用旧值；"
+                "如需改用「每天几点 + 星期几」方式填写，在 WebUI 里改一次"
+                "定时重启时间即可自动接管")
+            return
+
+        raw_time = str(sched.get("daily_restart_time") or "").strip()
+        hour, minute = 4, 0
+        if raw_time:
+            parsed = _parse_hhmm(raw_time)
+            if parsed is None:
+                issues.append(
+                    f"schedule.daily_restart_time={raw_time!r} 不是合法 HH:MM，回退 04:00")
+            else:
+                hour, minute = parsed
+        sched["daily_restart_time"] = f"{hour:02d}:{minute:02d}"
+
+        days_raw = sched.get("daily_restart_weekdays")
+        days: list[str] = []
+        if isinstance(days_raw, list):
+            for item in days_raw:
+                key = str(item).strip().lower()[:3]
+                if key in _WEEKDAY_INDEX:
+                    if key not in days:
+                        days.append(key)
+                elif str(item).strip():
+                    issues.append(
+                        f"schedule.daily_restart_weekdays 含未知星期 {item!r}，已忽略")
+        if not days:
+            days = list(_WEEKDAY_INDEX)
+        if len(days) == 7:
+            dow = "*"
+        else:
+            dow = ",".join(str(_WEEKDAY_INDEX[d]) for d in
+                           sorted(days, key=lambda d: _WEEKDAY_INDEX[d]))
+        sched["daily_restart_weekdays"] = [d for d in _WEEKDAY_INDEX if d in days]
+        sched["daily_restart_cron"] = f"{minute} {hour} * * {dow}"
 
     def validate(self) -> list[str]:
         """校验并就地修正非法配置。返回问题列表（空表示全部合法）。"""
@@ -793,6 +884,7 @@ class GuardianConfig:
         if isinstance(sched, dict):
             sched["daily_restart_targets"] = self.resolve_targets(
                 sched.get("daily_restart_targets"))
+            self._sync_daily_restart_cron(sched, issues)
 
         if not allow:
             issues.append(

@@ -29,30 +29,6 @@
     "description": "Docker 连接配置",
     "type": "object",
     "items": {
-      "socket_path": {
-        "description": "Docker socket 路径",
-        "type": "string",
-        "default": "",
-        "hint": "留空自动探测（DOCKER_HOST 优先）"
-      },
-      "api_version": {
-        "description": "Docker Engine API 版本",
-        "type": "string",
-        "default": "",
-        "hint": "留空自动协商"
-      },
-      "use_cli_fallback": {
-        "description": "socket 不可用时降级到 docker CLI",
-        "type": "bool",
-        "default": false,
-        "hint": "当前版本未实现 CLI 降级，留默认关闭"
-      },
-      "cli_path": {
-        "description": "docker CLI 路径",
-        "type": "string",
-        "default": "docker",
-        "hint": "仅在上面开启时才有意义"
-      },
       "timeout": {
         "description": "单次请求超时（秒，一般无需修改）",
         "type": "int",
@@ -273,10 +249,17 @@
         "type": "bool",
         "default": false
       },
-      "daily_restart_cron": {
-        "description": "定时重启 cron（5 字段，本地时区）",
+      "daily_restart_time": {
+        "description": "每天几点重启",
         "type": "string",
-        "default": "0 4 * * *"
+        "default": "04:00",
+        "hint": "24 小时制 HH:MM，服务器本地时区"
+      },
+      "daily_restart_weekdays": {
+        "description": "在星期几执行",
+        "type": "list",
+        "default": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"],
+        "hint": "留空 = 每天"
       },
       "daily_restart_targets": {
         "description": "定时重启目标（必须在白名单内）。可用别名 @self / @napcat",
