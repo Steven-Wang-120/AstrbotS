@@ -25,12 +25,6 @@
     "default": 60,
     "hint": "night 档位为其 3 倍，aggressive 为其 1/3"
   },
-  "dry_run": {
-    "description": "空跑模式（只观测不执行任何真实动作）",
-    "type": "bool",
-    "default": true,
-    "hint": "首次部署建议保持开启，确认无误后再关闭"
-  },
   "docker": {
     "description": "Docker 连接配置",
     "type": "object",

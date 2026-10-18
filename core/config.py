@@ -74,7 +74,6 @@ DEFAULTS: dict[str, Any] = {
     "mode": "server",
     "profile": "normal",
     "check_interval": 60,
-    "dry_run": True,
     "docker": {
         "socket_path": "/var/run/docker.sock",
         "api_version": "v1.44",
@@ -233,6 +232,14 @@ VALID_RELOGIN_METHODS = {"restart_container", "login_only", "disabled"}
 #: 在 NapCat 4.18.14 上是 404，策略形同虚设。归一化时迁移为 `login_only` 并记 issue。
 RELOGIN_METHOD_ALIASES = {"webui_quick_login": "login_only"}
 VALID_KERNEL_MODES = {"inproc", "ipc", "sidecar"}
+
+#: 已退役的配置键 -> 退役说明。`validate()` 遇到就删键并记一条 issue：
+#: 留着不删会让 WebUI 下次保存把旧键写回，删了不报则运维看不见"开关消失了"。
+RETIRED_KEYS: tuple[tuple[str, str], ...] = (
+    ("os_hint", "系统信息改由 env_platform 探针从宿主机侧采集，无需再手填"),
+    ("dry_run", "整插件级空跑已取消，配置面不再有该开关"),
+)
+
 #: B00 §7 用 `sidecar` 描述 D1-a 的部署形态，B16 §9 用 `ipc` 描述适配层的连接方式。
 #: 两者指的是同一件事（"内核不在本进程里"），这里统一到 `ipc` 作为内部规范值，
 #: `sidecar` 作为等价别名保留——避免文档里写的值在配置里填不进去。
@@ -436,13 +443,16 @@ class GuardianConfig:
         # ---- 退役键 ---------------------------------------------------- #
         # `os_hint` 曾出现在前端配置面：环境改由 `env_platform` 探针从宿主机侧
         # 采集后，手填值只会与真实镜像基底冲突，误导诊断。
+        # `dry_run` 曾是"整插件级空跑"开关：它把一条真实的短路逻辑塞进授权链，
+        # 让"能不能执行"取决于一个可被误开误关的全局位。配置面退役后，
+        # `dry_run` 只作为 `ActionSpec` / `Decision` 上的**逐次**标记存在
+        # （动作级语义，由 `SafetyGuard` 当次判定给出），不再有全局开关。
         # 必须**删键**（而不是留着不用），否则 WebUI 下次保存会把它写回来；
         # 同时给出可见告警，避免"开关消失了但没人知道"。
-        if "os_hint" in raw:
-            raw.pop("os_hint", None)
-            issues.append(
-                "os_hint 已退役并移除（系统信息改由 env_platform 探针"
-                "从宿主机侧采集，无需再手填）")
+        for key, note in RETIRED_KEYS:
+            if key in raw:
+                raw.pop(key, None)
+                issues.append(f"{key} 已退役并移除（{note}）")
 
         if raw.get("mode") not in VALID_MODES:
             issues.append(f"mode={raw.get('mode')!r} 非法，回退 server")

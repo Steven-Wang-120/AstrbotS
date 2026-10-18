@@ -6,7 +6,6 @@
   "mode": "server",
   "profile": "normal",
   "check_interval": 60,
-  "dry_run": true,
 
   "containers": {
     "astrbot": "astrbot",

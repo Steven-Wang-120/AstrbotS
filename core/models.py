@@ -117,6 +117,9 @@ class ActionSpec:
     kind: str
     target: str
     params: dict[str, Any] = field(default_factory=dict)
+    #: 动作级空跑标记：`SafetyGuard.authorize()` 给出的**逐次**判定结果，
+    #: 不是配置开关。为 True 时 action 只回执不产生副作用，且 `commit()`
+    #: 不消耗冷却/配额（空跑不该把后续真实动作挡掉）。
     dry_run: bool = False
     actor: str = "system"          # system | llm | command | lifecycle
     trigger: str = "interval"      # interval | deadline | llm | command | startup | manual

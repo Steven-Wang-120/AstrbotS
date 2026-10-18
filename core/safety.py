@@ -2,8 +2,8 @@
 
 对应文档：B12
 
-四重约束：白名单 / 冷却 / 每小时熔断 / dry-run。
-外加：受保护容器、参数规范化、连续失败降级、启动自检。
+四重约束：白名单 / 冷却 / 每小时熔断 / 参数规范化。
+外加：受保护容器、连续失败降级、启动自检。
 所有破坏性动作必须经 `authorize()` 才能执行。
 """
 
@@ -113,8 +113,6 @@ class SafetyGuard:
         allow = self.config.action_allowlist
         if not allow:
             warns.append("动作白名单为空：所有自动重启都会被拒绝")
-        if self.config.dry_run:
-            warns.append("dry_run=true：当前不会执行任何真实动作")
         if self.config.safety.allow_self_restart and not self.config.is_self(
                 self.config.containers.astrbot):
             warns.append("allow_self_restart 已开启，请确认看门狗策略可用")
@@ -124,8 +122,6 @@ class SafetyGuard:
                 warns.append("watchdog_request_path 为空，看门狗策略不可用")
         if not self.config.lifecycle.sleep_targets:
             warns.append("lifecycle.sleep_targets 为空：睡眠功能不可用")
-        if self.config.lifecycle.enabled and self.config.dry_run:
-            warns.append("lifecycle 开启且 dry_run=true：30 天保证将降级为强制告警")
         for w in warns:
             logger.warning(f"[guardian] 安全自检：{w}")
         return warns
@@ -207,7 +203,7 @@ class SafetyGuard:
                 return Decision(False, False, "包含本体的睡眠必须由宿主机看门狗接管全部目标", "watchdog_required")
             if not self.config.safety.watchdog_request_path:
                 return Decision(False, False, "看门狗请求路径未配置", "watchdog_unconfigured")
-        return Decision(True, self.config.dry_run, "全部睡眠目标通过授权", "dry_run" if self.config.dry_run else "ok")
+        return Decision(True, False, "全部睡眠目标通过授权", "ok")
 
     def _authorize_single(self, action: ActionSpec, now: float | None = None) -> Decision:
         now = time.time() if now is None else now
@@ -216,7 +212,7 @@ class SafetyGuard:
 
         # 只读动作直接放行
         if kind in READONLY_KINDS:
-            return Decision(True, cfg.dry_run, "只读动作", "readonly")
+            return Decision(True, False, "只读动作", "readonly")
 
         # 熔断
         if self.tripped:
@@ -287,18 +283,14 @@ class SafetyGuard:
                             f"目标 {action.target} 连续失败 {fs} 次，降级为只告警",
                             "fail_streak")
 
-        # dry-run 短路
-        if cfg.dry_run:
-            return Decision(True, True, "dry-run：仅记录不执行", "dry_run")
-
         return Decision(True, False, "通过", "ok")
 
     # ------------------------------------------------------------------ #
     def commit(self, action: ActionSpec, ok: bool) -> list[tuple[str, int]]:
         """动作执行后登记：冷却时间戳、动作计数、失败连击。
 
-        注意：dry-run 不产生真实副作用，因此**不消耗**冷却与配额，
-        否则空跑会把后续真实动作全部挡掉。
+        注意：dry-run 动作（`ActionSpec.dry_run`，由 `authorize()` 给出）不产生
+        真实副作用，因此**不消耗**冷却与配额，否则空跑会把后续真实动作全部挡掉。
 
         返回值：本轮**首次**跨过连续失败阈值的目标列表 ``[(target, streak), ...]``。
         调用方（引擎）据此执行 B00 §10.6 的"降级为只告警 + 进入 maintenance 档位"。

@@ -483,7 +483,6 @@ class HealthEngine:
         return {
             "mode": self.state.get("mode") or self.config.mode,
             "profile": self.state.get("profile") or self.config.profile,
-            "dry_run": self.config.dry_run,
             "last_run_ts": self._last_run_ts,
             "last_trigger": self._last_trigger,
             "results": [r.to_dict() for r in self._last_results.values()],
@@ -515,8 +514,7 @@ class HealthEngine:
         lines.append("== 守护系统健康快照 ==")
         lines.append(
             f"模式: {self.state.get('mode') or cfg.mode} | "
-            f"档位: {self.state.get('profile') or cfg.profile} | "
-            f"dry-run: {'开' if cfg.dry_run else '关'}")
+            f"档位: {self.state.get('profile') or cfg.profile}")
         lines.append(
             f"生命周期: {self.lifecycle_policy.describe(self.lifecycle_state)}")
         if self.safety.tripped:

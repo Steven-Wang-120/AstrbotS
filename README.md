@@ -107,10 +107,11 @@ AstrBot 通常已内置；缺失时会按 `requirements.txt` 自动安装。
 
 1. 先把 `containers.*` / `containers.managed` 填对，`/guardian safety` 里不应再有
    「白名单为空」告警。
-2. **保持 `dry_run: true`（默认）观察若干天**：日志里会出现 `[dry-run] 将...`，
-   通知与审计照常，但不会有任何真实动作。
-3. 确认巡检结论正确后关闭 `dry_run`。若还想再稳一轮，可临时用
-   `profile=maintenance` 跑一次 `/guardian check`。
+2. 先用 `profile=maintenance` 跑一次 `/guardian check`：maintenance 档位暂停自动
+   动作，只出巡检结论，可在不产生任何副作用的前提下核对判据。
+3. 确认巡检结论正确后把档位调回 `normal`。若还想再稳一轮，可把
+   `safety.allowed_containers` 先留空（所有自动重启都会被拒绝），观察几天日志里
+   被拒绝的理由，再放开。
 4. 本体自重启另需 `safety.allow_self_restart: true` +
    `safety.self_restart_strategy: "watchdog"` + 看门狗已运行（见 §7）。
 5. `lifecycle.levels` 决定分级阈值与注入提示词，可按需调整
@@ -213,7 +214,7 @@ QQ 掉线后如果会话已过期，`restart_container` 重启多少次都回不
 
 - 所有动作目标必须命中 `containers.managed` 白名单；本体容器默认受保护。
 - 冷却（`safety.action_cooldown_sec`）与每小时熔断（`safety.max_actions_per_hour`）双限流。
-- `dry_run` 打开时只记录不执行。
+- 连续失败达阈值自动降级为只告警，不会无限重试。
 - 不提供任意 shell 执行能力；ROS2 恢复命令仅来自配置白名单。
 - 密码建议填 md5，避免明文落盘；插件日志与审计**不记录**密码、credential 或 md5。
 
@@ -293,9 +294,10 @@ astrbot_plugin_guardian/        ← 仓库根 = 插件根
 同步修改 `containers.astrbot` / `containers.napcat` 和 `containers.managed`。
 
 **Q：想先「只看不动手」试跑一段时间怎么办？**
-保持 `dry_run: true`（默认）观察若干天，日志中会出现 `[dry-run] 将...`；
-确认巡检结论正确后再关闭。若只想暂停周期动作、但仍要通知，可临时把 `profile`
-设为 `maintenance`。
+把 `profile` 设为 `maintenance`：该档位暂停周期巡检与所有自动动作，但
+`/guardian check` 仍可手动跑并出完整结论。若既要继续周期巡检、又不想真的动手，
+把 `safety.allowed_containers` 留空——所有自动重启都会以「不在动作白名单内」被拒，
+审计里能看到完整的拒绝理由。观察满意后再放开。
 
 ---
 

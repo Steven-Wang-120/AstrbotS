@@ -170,7 +170,7 @@ class GuardianKernel:
         self.audit.append(kind="runtime.start", detail="守护运行时启动", ok=True)
         logger.info(
             f"[guardian] 守护系统已启动 | 模式={self.state.get('mode')} "
-            f"档位={self.state.get('profile')} dry_run={self.config.dry_run} "
+            f"档位={self.state.get('profile')} "
             f"kernel.mode={self.config.kernel.mode} "
             f"direct_actions={self.direct_actions} "
             f"数据目录={self.data_dir}")
@@ -179,8 +179,7 @@ class GuardianKernel:
         if self.config.notify.umo_list:
             await self.notifier.push(
                 f"[守护] 守护系统已启动（模式 {self.state.get('mode')}，"
-                f"档位 {self.state.get('profile')}，dry-run "
-                f"{'开' if self.config.dry_run else '关'}）",
+                f"档位 {self.state.get('profile')}）",
                 severity=Severity.INFO, force=True)
 
     async def stop(self) -> None:
@@ -387,12 +386,11 @@ class GuardianKernel:
     def runtime_flags(self) -> dict[str, Any]:
         """适配层做 L-D 二次确认所需的**权威**开关。
 
-        必须由内核回答：适配层若拿自己那份配置副本判断 `dry_run`，两份配置一旦
-        漂移，就会出现"适配层以为在 dry-run、内核其实已关"的无确认真睡眠。
+        必须由内核回答：适配层若拿自己那份配置副本判断，两份配置一旦漂移，
+        就会出现"适配层以为要确认、内核其实已放行"的无确认破坏性动作。
         """
         return {
             "enabled": bool(self.config.enabled),
-            "dry_run": bool(self.config.dry_run),
             "lifecycle_enabled": bool(self.config.lifecycle.enabled),
             "require_admin": bool(self.config.llm_tools.require_admin),
             "sleep_targets": list(self.config.lifecycle.sleep_targets or []),
@@ -494,8 +492,7 @@ class GuardianKernel:
     def health_report(self, scope: str = "all") -> str:
         snap = self.engine.snapshot()
         lines = [
-            f"模式: {snap['mode']} | 档位: {snap['profile']} | "
-            f"dry-run: {'开' if snap['dry_run'] else '关'}",
+            f"模式: {snap['mode']} | 档位: {snap['profile']}",
         ]
         if scope in ("all", "containers"):
             lines.append("容器:")
