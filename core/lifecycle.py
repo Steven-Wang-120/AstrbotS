@@ -53,6 +53,18 @@ class LifecycleState:
     #: **只影响提示词注入**，不影响 `level_index` / `sleep_armed`——等级与
     #: 武装状态永远由 uptime 决定，窗口无权改写它们。
     suppressed_until: float = 0.0
+    #: 最近一次"已经说出口"的主动消息标识。
+    #:
+    #: 这里刻意**不做频率限制**：Bot 说完就去睡了，睡下之后不可能再发第二条，
+    #: 冷却窗口在本场景里是多余的复杂度。真正要防的是"同一件事说两遍"：
+    #: 插件重载、内核重启、轮询撞车、或者 L3 报备完之后管理员回了句话
+    #: 导致 `recent_talk` 把睡眠推后、下一轮又想报备一次。
+    #:
+    #: 因此用"事件键"而不是"时间窗口"：键相同就说明是同一个事件，不再重复。
+    #: 键形如 `sleep:L3:600.0`（等级 + 触发时的整点 uptime）、`deferred:L3`、
+    #: `resume:1729260000`（上次入睡时刻）。
+    announced_key: str = ""
+    announced_at: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -68,6 +80,8 @@ class LifecycleState:
             "clock_skew_warned": self.clock_skew_warned,
             "deferred_since": self.deferred_since,
             "suppressed_until": self.suppressed_until,
+            "announced_key": self.announced_key,
+            "announced_at": self.announced_at,
         }
 
     @classmethod
@@ -217,6 +231,9 @@ class LifecyclePolicy:
         # 睡过一觉，顺延与抑制都结清了：下一次"想睡"重新从零开始计时。
         st.deferred_since = 0.0
         st.suppressed_until = 0.0
+        # `announced_key` **不清**：醒来后的"我回来了"要靠它跟睡前那条
+        # 区分成两个事件（键不同），而同一个轮次重复上报则靠它去重。
+        # 清掉反而会让 sleep 那条在醒来瞬间被重发一次。
 
     def describe(self, st: LifecycleState) -> str:
         nxt = self.next_level(st.level_index)

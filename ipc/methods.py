@@ -159,6 +159,51 @@ def build_handlers(kernel: Any) -> dict[str, Handler]:
     async def h_sleep_armed(p: dict) -> bool:
         return bool(kernel.sleep_armed())
 
+    # ---- 主动消息 ------------------------------------------------------ #
+    async def h_sleepy_facts(p: dict) -> dict:
+        """现在该不该说"我要睡了"，以及要说清哪些事实（只读）。
+
+        返回 `{}` 表示这轮不开口——不是错误，所以不用 `IpcError`。
+        适配层拿到空字典就什么都不做。
+        """
+        now = p.get("now")
+        try:
+            moment = float(now) if now is not None else None
+        except (TypeError, ValueError):
+            moment = None
+        return _jsonable(kernel.sleepy_facts(now=moment) or {})
+
+    async def h_resume_facts(p: dict) -> dict:
+        now = p.get("now")
+        try:
+            moment = float(now) if now is not None else None
+        except (TypeError, ValueError):
+            moment = None
+        return _jsonable(kernel.resume_facts(now=moment) or {})
+
+    async def h_announce_config(p: dict) -> dict:
+        """主动消息配置 + 三个模板（含"留空回退内置"的解析结果）。"""
+        return _jsonable(kernel.announce_config() or {})
+
+    async def h_peer_stats(p: dict) -> dict:
+        """报备地址与"说了没人应"的计数。"""
+        return _jsonable(kernel.peer_stats() or {})
+
+    async def h_announce_state(p: dict) -> dict:
+        return _jsonable(kernel.announce_state() or {})
+
+    async def h_claim_announce(p: dict) -> dict:
+        """占用事件键。**必须在 LLM 生成成功之后调**，否则超时会烧掉这次机会。"""
+        key = _as_str(p.get("key"), "", limit=96)
+        if not key:
+            raise IpcError(E_BAD_REQUEST, "key 不能为空")
+        return {"claimed": bool(kernel.claim_announce(key))}
+
+    async def h_note_unanswered(p: dict) -> dict:
+        """记账：又发了一条没人应（answered=False），或有人说话了（answered=True）。"""
+        value = kernel.note_unanswered(_as_bool(p.get("answered"), False))
+        return {"unanswered": int(value)}
+
     # ---- 有副作用 ------------------------------------------------------ #
     async def h_run_check(p: dict) -> dict:
         return _jsonable(await kernel.run_check(
@@ -212,7 +257,14 @@ def build_handlers(kernel: Any) -> dict[str, Handler]:
 
     # ---- 适配层 → 内核的记账（审计/活跃度由内核单写者持有，I1） ---------- #
     async def h_note_event(p: dict) -> None:
-        kernel.note_event()
+        """适配层 → 内核的活跃度记账。
+
+        只带"谁在哪个会话发过言"，**不带消息内容**（P1：绝不解析对话）。
+        """
+        kernel.note_event(
+            umo=_as_str(p.get("umo"), "", limit=200),
+            is_admin=_as_bool(p.get("is_admin"), False),
+            place=_as_str(p.get("place"), "", limit=16))
         return
 
     async def h_audit_append(p: dict) -> None:
@@ -246,6 +298,13 @@ def build_handlers(kernel: Any) -> dict[str, Handler]:
         "runtime_flags": h_runtime_flags,
         "env_info": h_env_info,
         "sleep_armed": h_sleep_armed,
+        "sleepy_facts": h_sleepy_facts,
+        "resume_facts": h_resume_facts,
+        "announce_config": h_announce_config,
+        "announce_state": h_announce_state,
+        "peer_stats": h_peer_stats,
+        "claim_announce": h_claim_announce,
+        "note_unanswered": h_note_unanswered,
         "run_check": h_run_check,
         "request_sleep": h_request_sleep,
         "restart_container": h_restart_container,
@@ -278,6 +337,9 @@ METHOD_NAMES = frozenset({
     "request_qq_login", "qq_login_status",
     "start_container", "set_mode", "set_profile", "note_event",
     "audit_append", "ping",
+    # 主动消息
+    "sleepy_facts", "resume_facts", "announce_config", "announce_state",
+    "peer_stats", "claim_announce", "note_unanswered",
 })
 
 #: 会产生真实副作用的 method（服务端超时后**不得重试**，避免重复执行）
@@ -285,6 +347,9 @@ MUTATING_METHODS = frozenset({
     "run_check", "request_sleep", "restart_container", "start_container",
     "request_qq_login",
     "set_mode", "set_profile", "note_event", "audit_append",
+    # 前四个只读；这三个改内核状态，超时重试会让"说过了"变成"没说过"，
+    # 于是同一条消息被发两遍。
+    "claim_announce", "note_unanswered",
 })
 
 

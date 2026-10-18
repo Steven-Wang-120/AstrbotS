@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import sys
 from typing import Any
@@ -24,7 +26,6 @@ try:
     from astrbot.api.event.filter import EventMessageType
 except ImportError:  # pragma: no cover - 兼容更早/非标准布局
     from astrbot.api.event import EventMessageType  # type: ignore
-import contextlib
 
 from astrbot.api.star import Context, Star
 
@@ -56,7 +57,7 @@ except ImportError:  # pragma: no cover
 PLUGIN_NAME = "astrbot_plugin_guardian"
 PLUGIN_DESC = "守护系统：服务器/ROS2 双模式健康守护（容器自愈 / QQ 账密登录恢复 / 内存防护 / 自主睡眠）"
 PLUGIN_AUTHOR = "AstrbotS"
-PLUGIN_VERSION = "0.7.0"
+PLUGIN_VERSION = "0.8.0"
 
 HELP_TEXT = """== 守护系统 Guardian ==
 /guardian status                 健康快照（含运行时长与生命周期等级）
@@ -73,11 +74,21 @@ HELP_TEXT = """== 守护系统 Guardian ==
 /guardian diagnose <目标|all>    诊断
 /guardian jobs                   查看下次任务计划
 /guardian safety                 查看安全自检结果
+/guardian announce [sleep|deferred|resume]  预览"Bot 现在会怎么说"（不发送）
 /guardian reset                  复位内核自修复额度（管理员）
 /guardian help                   本帮助
 别名：/守护
 说明：本插件不会根据对话关键词触发任何动作；所有动作来自定时巡检、
-生命周期等级推进或 Bot 自主调用工具。"""
+生命周期等级推进或 Bot 自主调用工具。
+
+关于"Bot 自己去说要睡了"：
+  到达 L3（准备睡眠）且真睡得成、或 L4（强制睡眠）时，Bot 会主动发一条
+  消息告诉管理员。**说什么由模型当场决定**，插件只负责提供事实（在线多久、
+  几级了、睡多久、离窗口还有多远）和一段任务说明。三个模板可以在配置的
+  lifecycle 段里改写（sleepy_prompt / sleepy_deferred_prompt / resume_prompt），
+  留空就是用内置的。睡醒后也会自动报一句（post_sleep_announce）。
+  它不是定时的——等级只由运行时长决定，作息窗口只决定"能不能睡"，不会
+  一到夜里就让 Bot 说自己困了。"""
 
 
 def _event_text(event: AstrMessageEvent) -> str:
@@ -95,6 +106,19 @@ def _event_text(event: AstrMessageEvent) -> str:
     return getattr(event, "message_str", "") or ""
 
 
+def _place_text(umo: str) -> str:
+    """把 UMO 描述成"群里 / 私聊"，供提示词里提到场景用。
+
+    不把群号发给模型：它不需要，而且那句话最终会出现在聊天记录里。
+    """
+    lowered = str(umo or "").lower()
+    if "group" in lowered:
+        return "群里"
+    if "friend" in lowered or "private" in lowered or "direct" in lowered:
+        return "私聊"
+    return ""
+
+
 class GuardianPlugin(Star):
     def __init__(self, context: Context, config: Any = None):
         super().__init__(context)
@@ -105,6 +129,8 @@ class GuardianPlugin(Star):
         self.raw_config = raw
         self.runtime = GuardianRuntime(context, raw)
         self._started = False
+        #: 主动消息轮询任务。`None` = 没在跑（未启动 / 已 terminate）。
+        self._announce_task: asyncio.Task | None = None
 
     # ================================================================== #
     # 生命周期钩子
@@ -114,6 +140,7 @@ class GuardianPlugin(Star):
         try:
             await self.runtime.start()
             self._started = True
+            self._start_announce_loop()
         except Exception as exc:  # noqa: BLE001
             logger.error(f"[guardian] 启动失败: {exc}", exc_info=True)
         self._register_webapi()
@@ -162,6 +189,7 @@ class GuardianPlugin(Star):
             if not self._started:
                 await self.runtime.start()
                 self._started = True
+            self._start_announce_loop()
             # 重载路径同样要保证状态页在（register_web_api 对同路由是替换语义）。
             self._register_webapi()
         except Exception as exc:  # noqa: BLE001
@@ -169,6 +197,9 @@ class GuardianPlugin(Star):
 
     async def terminate(self):
         """插件卸载 / 停用 / 重载时调用：严格清理，避免任务残留（R10）。"""
+        # 先停轮询，再停运行时：反过来的话轮询会在 runtime 已关连接后
+        # 还去 call 一次内核，每次重载都刷一串"内核不可达"告警。
+        self._cancel_announce_loop()
         try:
             await self.runtime.stop()
         except Exception as exc:  # noqa: BLE001
@@ -176,12 +207,226 @@ class GuardianPlugin(Star):
         self._started = False
 
     # ================================================================== #
+    # 主动消息：Bot 自己去跟管理员说一声要睡了
+    # ================================================================== #
+    # 分工（重要）：
+    #   - **睡前那句**由内核在真睡眠之前同步发出（`kernel_runtime.
+    #     _announce_before_sleep`）。它跟睡眠动作在同一个调用栈里，不存在
+    #     "刚好错过"的问题，这是可靠性最高的位置。
+    #   - **这个轮询**只负责内核管不到的两件事：睡醒报备、"还没睡成"报备。
+    #     它们对时效不敏感，晚一分钟说完全没影响。
+    ANNOUNCE_POLL_SEC = 120.0
+    #: 启动后先等一会儿：插件刚起来时 uptime 探针还没跑过，`sleepy_facts`
+    #: 会因为"uptime 不可信"返回空——不是错误，但立刻轮询会白刷一轮日志。
+    ANNOUNCE_WARMUP_SEC = 30.0
+
+    def _start_announce_loop(self) -> None:
+        if self._announce_task is not None and not self._announce_task.done():
+            return
+        self._announce_task = asyncio.create_task(self._announce_loop())
+
+    def _cancel_announce_loop(self) -> None:
+        task = self._announce_task
+        self._announce_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _announce_loop(self) -> None:
+        try:
+            await asyncio.sleep(self.ANNOUNCE_WARMUP_SEC)
+            while True:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._announce_once()
+                await asyncio.sleep(self.ANNOUNCE_POLL_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 轮询线程绝不能死
+            logger.warning(f"[guardian] 主动消息循环异常退出: {exc}")
+
+    async def _announce_preview(self, args: list[str]) -> str:
+        """生成一条"现在会说的话"给人看，**不发送、不占坑、不改任何状态**。
+
+        为什么需要它：真触发要等 600 小时 uptime，正常人不会等 25 天去
+        验证一次。没有预览的话，这套功能只能靠"读代码 + 相信"来确认。
+
+        `kind` 可选 sleep / deferred / resume，用来分别检查三个模板；
+        不带参数时依次试，把当前"说得成"的那个打出来。
+        """
+        rt = self.runtime
+        want = (args[0].lower() if args else "")
+        cfg = await rt.announce_config()
+        peer = await rt.peer_stats()
+        umo = str(peer.get("umo") or "")
+
+        lines = [
+            "== 主动消息预览（不会发送）==",
+            f"开关: {cfg.get('mode')} | 睡醒报备: "
+            f"{'开' if cfg.get('post_sleep') else '关'} | "
+            f"没人应上限: {cfg.get('max_unanswered')}",
+            f"收件人: {umo or '(暂无，Bot 没收到过消息)'}"
+            + (f"（{peer.get('place')}）" if peer.get("place") else ""),
+            f"已发言次数(无人应): {peer.get('count')}",
+        ]
+
+        candidates: list[dict[str, Any]] = []
+        if want in ("", "sleep"):
+            f = await rt.sleepy_facts()
+            if f:
+                candidates.append(f)
+        if want in ("", "deferred"):
+            # deferred 只在 always 模式下才会返回；这里不改配置，
+            # 拿不到就直接说明原因，而不是伪造一次。
+            f = await rt.sleepy_facts()
+            if f and f.get("kind") == "deferred":
+                candidates.append(f)
+        if want in ("", "resume"):
+            f = await rt.resume_facts()
+            if f:
+                candidates.append(f)
+
+        if not candidates:
+            lines.append("")
+            lines.append("今天没有可报备的事件。可能的原因：")
+            lines.append("  - 等级还没到 L3（需要 600 小时 uptime）；")
+            lines.append("  - 不在作息窗口内，且没开 always；")
+            lines.append("  - 最近 10 分钟有人在说话（本次已顺延）；")
+            lines.append("  - 睡醒报备已过期（超过 6 小时）或已发过。")
+            st = await rt.lifecycle_status_text()
+            lines.append("")
+            lines.append(st)
+            return "\n".join(lines)
+
+        for f in candidates:
+            facts = dict(f)
+            if umo:
+                facts["umo"] = umo
+            lines.append("")
+            lines.append(f"--- {facts.get('kind')} ---")
+            lines.append(f"事件键: {facts.get('event_key')}")
+            try:
+                text = await rt.compose_announce(facts, cfg)
+            except Exception as exc:  # noqa: BLE001
+                lines.append(f"生成失败: {exc}")
+                continue
+            lines.append(text or "(模型没返回内容——检查 provider 与模板配置)")
+        return "\n".join(lines)
+
+    async def _announce_once(self, *, force_kinds: tuple[str, ...] = ()) -> bool:
+        """跑一轮：判断 -> 生成 -> 占坑 -> 发送。返回是否真发了。
+
+        这个循环**只负责"睡醒报备"和 always 模式下的"还没睡成"报备**。
+        "我要睡了"由内核在真睡眠之前同步发出（见 `kernel_runtime.
+        _announce_before_sleep`）——那条路径比轮询可靠，因为它跟睡眠动作
+        在同一个调用栈里，不存在"刚好错过 120 秒窗口"的问题。
+
+        顺序是刻意排的，每一环都有具体的失败模式在背后：
+
+        1. **先看地址**：没有收件人就别白花一次 LLM 调用；
+        2. **再看自限**：说了太多次没人应就先闭嘴，也别浪费 token；
+        3. **生成**：拿模板 + 事实去问模型；
+        4. **成功的生成之后才 `claim_announce`**：反过来做的话，一次网络
+           超时就把这次事件键烧掉，接下来一小时都不会再试（而 bot 其实
+           一句没说出来）；
+        5. **发送**，然后记 `note_unanswered(False)`。
+        """
+        rt = self.runtime
+        peer = await rt.peer_stats()
+        umo = str(peer.get("umo") or "")
+        if not umo:
+            return False
+
+        cfg = await rt.announce_config()
+        mode = str(cfg.get("mode") or "on_arm")
+        if mode == "off":
+            return False
+
+        max_unanswered = int(cfg.get("max_unanswered") or 0)
+        unanswered = int(peer.get("count") or 0)
+        if max_unanswered > 0 and unanswered >= max_unanswered:
+            # 不是错误，是设计：对着一个没人理的会话反复主动说话，
+            # 比沉默更糟。任何一条用户消息都会把它清零。
+            logger.debug(
+                f"[guardian] 主动消息暂停：已连续 {unanswered} 次无回应"
+                f"（上限 {max_unanswered}）")
+            return False
+
+        # 睡醒优先：刚回来时报一句"我回来了"比再念叨睡意更有意义。
+        facts: dict[str, Any] = {}
+        if not force_kinds or "resume" in force_kinds:
+            facts = await rt.resume_facts()
+        if not facts and (not force_kinds or "sleep" in force_kinds):
+            facts = await rt.sleepy_facts()
+        if not facts:
+            return False
+
+        # 睡意事件（kind=sleep）已由内核在睡前发过，轮询不再重复。
+        # 只有在"内核没发成功"这种极端情况下才会走到这里，而那时
+        # `announced_key` 已经占坑，下面的去重会拦掉。
+        event_key = str(facts.get("event_key") or "")
+        state = await rt.announce_state()
+        if event_key and event_key == str(state.get("announced_key") or ""):
+            return False
+
+        facts["umo"] = umo
+        facts["place"] = str(peer.get("place") or "")
+        try:
+            text = await rt.compose_announce(facts, cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[guardian] 主动消息生成异常：{exc}")
+            return False
+        if not text:
+            return False
+
+        if not await rt.claim_announce(event_key):
+            # 另一个轮次抢先说过同一件事（重载后双循环、或用户同时点了
+            # 一次强制报备）。丢弃，不重复发送。
+            logger.debug(f"[guardian] 主动消息事件已由其他轮次发出：{event_key}")
+            return False
+
+        try:
+            await rt._send(umo, text)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[guardian] 主动消息发送失败：{exc}")
+            return False
+
+        await rt.note_unanswered(answered=False)
+        await rt.audit_append(
+            kind="announce.sent", target=str(facts.get("kind") or ""),
+            detail=(f"{event_key} | {text[:120]}"), ok=True,
+            actor="lifecycle", trigger="announce")
+        logger.info(f"[guardian] 主动消息已发送（{facts.get('kind')} -> {umo}）：{text}")
+        return True
+
+
+    # ================================================================== #
     # 观测：记录消息活跃度（供 QQ 在线证据链使用，不做任何触发）
     # ================================================================== #
     @filter.event_message_type(EventMessageType.ALL)
     async def observe_message(self, event: AstrMessageEvent):
+        """只记录"谁在哪个会话发过言"，**绝不解析消息内容**（P1 / B15 §6）。
+
+        三件事，都不需要读正文：
+
+        1. 记活跃时间（QQ 在线证据链）；
+        2. 记收件地址（`notify.umo_list` 常为空，主动消息靠这个找得到人）；
+        3. 有人说话就清零"说了没人应"的计数——否则昨晚连说三次之后，
+           今天有人接话了反而继续沉默。
+        """
         with contextlib.suppress(Exception):
-            await self.runtime.note_event()
+            umo = ""
+            place = ""
+            is_admin = False
+            with contextlib.suppress(Exception):
+                umo = str(event.unified_msg_origin or "")
+            with contextlib.suppress(Exception):
+                is_admin = bool(event.is_admin())
+            with contextlib.suppress(Exception):
+                place = _place_text(umo)
+            await self.runtime.note_event(umo=umo, is_admin=is_admin, place=place)
+            if await self.runtime.note_unanswered(answered=True):
+                # 上一次发出去的消息有人接了：不必再额外做什么，清零本身就是
+                # 全部副作用。留着这个分支是为了让"清零"这件事在日志里可见。
+                logger.debug("[guardian] 有人回应，主动消息计数已清零")
 
     # ================================================================== #
     # 命令入口
@@ -205,6 +450,11 @@ class GuardianPlugin(Star):
 
         if sub in ("help", "?", "-h", "--help"):
             return HELP_TEXT
+        if sub == "announce":
+            # 预览：**不发送**，只把"现在会说什么"打出来。
+            # 这是这套功能唯一诚实的自查方式——主动消息的触发条件是
+            # 上线 600 小时，正常部署里没人愿意等 25 天去验证一次。
+            return await self._announce_preview(args[1:])
         if sub == "status":
             return await rt.status_text()
         if sub == "env":

@@ -26,6 +26,7 @@ import os
 import time
 from typing import Any
 
+from .core.announce import render_template
 from .core.config import build_config
 from .core.log import logger
 from .ipc.backend import IpcBackend, LocalBackend
@@ -38,6 +39,10 @@ NOTE_EVENT_COALESCE_SEC = 10.0
 
 #: L4 掉线告警的轮询间隔
 OUTAGE_POLL_SEC = 15.0
+
+#: 主动消息的单条上限。模型偶尔会开始解释自己的"系统任务"，截断比整条
+#: 丢弃更容易排查。模块级而不是类属性，因为 `_clean_announce` 是静态方法。
+ANNOUNCE_MAX_CHARS = 800
 
 # --------------------------------------------------------------------------- #
 # 消息链构造（跨版本兼容）
@@ -178,6 +183,10 @@ class GuardianAdapter:
                 sender=self._send,
                 action_caller=self._call_onebot,
             )
+            # 睡前报备的文本生成：# 内核不能调 LLM（I6），但"要睡了"这个
+            # 决定发生在内核的 tick 里。注入一个闭包既能保持边界，又能让
+            # 报备在**睡眠动作执行前**真正发出，而不是等下一次轮询。
+            self.kernel.set_announce_composer(self._compose_for_kernel)
             self._backend = LocalBackend(self.kernel)
 
     # ------------------------------------------------------------------ #
@@ -335,19 +344,34 @@ class GuardianAdapter:
     async def set_profile(self, profile: str) -> tuple[bool, str]:
         return _unpair(await self._call("set_profile", {"profile": profile}))
 
-    async def note_event(self) -> None:
-        """记录一次用户消息活跃度（供 QQ 证据链）。
+    async def note_event(self, umo: str = "", is_admin: bool = False,
+                         place: str = "") -> None:
+        """记录一次用户消息活跃度（供 QQ 证据链 + 主动消息的收件地址）。
 
         合并窗口：`observe_message` 对**每条**消息都会调用，若每条都发一次 IPC
         往返，成本会随聊天频率线性上升。这里 10s 内合并成一次；窗口外的第一条
         立即发送，保证"最近活跃时间"不会被拖太久。
+
+        **管理员消息不吃合并窗口**：合并的目的是省往返，而地址的准确性比这点
+        往返更值钱。若管理员刚说完话、紧接着群里有人跟了一句，走合并就会把
+        `announce.last_umo` 留在一个普通群友身上，报备消息会发错人。
+        管理员发言本身很稀疏（不是热路径），绕过合并没有成本问题。
+
+        `umo` / `place` / `is_admin` 只描述"谁在哪个会话"，**不含任何消息
+        内容**（P1：绝不解析对话）。
         """
         now = time.time()
-        if now - self._last_note_ts < NOTE_EVENT_COALESCE_SEC:
+        if not is_admin and now - self._last_note_ts < NOTE_EVENT_COALESCE_SEC:
             return
-        self._last_note_ts = now
+        if not is_admin:
+            self._last_note_ts = now
+        payload: dict[str, Any] = {}
+        if umo:
+            payload["umo"] = umo
+            payload["is_admin"] = bool(is_admin)
+            payload["place"] = place or ""
         with contextlib.suppress(IpcError):
-            await self._call("note_event", {})
+            await self._call("note_event", payload)
 
     async def audit_append(self, *, kind: str, target: str = "",
                            detail: str = "", ok: bool = True,
@@ -419,6 +443,279 @@ class GuardianAdapter:
 
     async def sleep_armed(self) -> bool:
         return bool(await self._call("sleep_armed"))
+
+    # ================================================================== #
+    # 主动消息（Bot 自己去跟管理员说要睡了）
+    # ================================================================== #
+    async def sleepy_facts(self) -> dict[str, Any]:
+        """内核判定"这轮该不该说"，返回结构化事实；空字典 = 不开口。"""
+        return dict(await self._call("sleepy_facts") or {})
+
+    async def resume_facts(self) -> dict[str, Any]:
+        return dict(await self._call("resume_facts") or {})
+
+    async def announce_config(self) -> dict[str, Any]:
+        return dict(await self._call("announce_config") or {})
+
+    async def announce_state(self) -> dict[str, Any]:
+        return dict(await self._call("announce_state") or {})
+
+    async def peer_stats(self) -> dict[str, Any]:
+        return dict(await self._call("peer_stats") or {})
+
+    async def claim_announce(self, key: str) -> bool:
+        r = await self._call("claim_announce", {"key": key})
+        return bool((r or {}).get("claimed"))
+
+    async def note_unanswered(self, answered: bool = False) -> int:
+        r = await self._call("note_unanswered", {"answered": bool(answered)})
+        try:
+            return int((r or {}).get("unanswered") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    #: 单次生成的上限（见模块级 `ANNOUNCE_MAX_CHARS`）。
+    ANNOUNCE_MAX_CHARS = ANNOUNCE_MAX_CHARS
+
+    #: 生成超时。这条消息不紧急——晚 15 秒说完全没影响，但卡住轮询会让
+    #: 后续每一次心跳都排队。宁可这次不说，也不能拖住循环。
+    ANNOUNCE_LLM_TIMEOUT = 20.0
+
+    #: 睡前报备的生成上限。这段等待发生在**执行 sleep 动作之前**，而 sleep
+    #: 会重启容器——所以必须短。宁可这句没发出去，也不能让 30 天硬上限的
+    #: 强制睡眠被一次 LLM 超时拖住。
+    ANNOUNCE_BEFORE_SLEEP_TIMEOUT = 6.0
+
+    async def _compose_for_kernel(self, facts: dict[str, Any]) -> str:
+        """注入给内核的生成器（只在 `inproc` 模式下装配）。
+
+        额外套一层更短的超时：内核是在"马上就要 sleep"的路径上同步等它，
+        用轮询那套 20 秒超时会把强制睡眠整条链路拖慢三倍。
+        """
+        try:
+            # 直接问内核实例，**不要**走 `_call`：这个组合器是从内核内部
+            # 被同步等着的，再发一次 IPC/backend 调用会自己等自己。
+            cfg = self.kernel.announce_config() if self.kernel is not None else {}
+            return await asyncio.wait_for(
+                self.compose_announce(facts, cfg),
+                timeout=self.ANNOUNCE_BEFORE_SLEEP_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning("[guardian] 睡前报备生成超时，改用事实兜底")
+            return ""
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[guardian] 睡前报备生成失败：{exc}")
+            return ""
+
+    async def compose_announce(self, facts: dict[str, Any],
+                               config: dict[str, Any] | None = None
+                               ) -> str:
+        """把内核给的事实交给 LLM，让它自己决定怎么说。
+
+        用户明确要求「到底说什么让 LLM 自己决定」，所以这里**不拼任何话术**：
+        模板来自配置（`[系统任务]/[我现在的状况]/[行动指南]/[最终指令]`），
+        `{{…}}` 占位符由 `core.announce.render_template` 用事实填掉，剩下的
+        全部交给模型。
+
+        失败一律返回空串，由调用方决定不说。这里不抛异常：一次生成失败
+        不该让整个巡检循环抖一下。
+        """
+        cfg = config or {}
+        key = str(facts.get("template_key") or "sleepy_prompt")
+        prompts = cfg.get("prompts") or {}
+        template = ""
+        if isinstance(prompts, dict):
+            template = str(prompts.get(key) or "")
+        if not template:
+            logger.warning(f"[guardian] 主动消息模板缺失（{key}），本次跳过")
+            return ""
+
+        prompt = render_template(template, facts)
+        text = await self._llm_text(prompt, facts)
+        text = self._clean_announce(text)
+        if not text:
+            logger.warning("[guardian] 主动消息生成结果为空，本次跳过")
+            return ""
+        return text
+
+    @staticmethod
+    def _clean_announce(text: str, max_chars: int | None = None) -> str:
+        """去掉模型爱加的脚手架前缀，其余原样保留。
+
+        只做三件事，且都只碰**开头**：
+        - 去掉 `[系统任务…]` / `[守护]` / `[系统]` / `[主动消息]` 这类前缀
+          （模板里已经明令不要，但模型偶尔还是会顺手加上）；
+        - 去掉包裹整体的引号（模型有时把"要说的话"当引用一样括起来）；
+        - 截断到 `ANNOUNCE_MAX_CHARS`。
+
+        不做更激进的清洗（不删表情、不改标点、不去换行）：那是模型
+        表达的一部分，改了就变成"我又在替它决定怎么说"。
+        """
+        out = (text or "").strip()
+        if not out:
+            return ""
+        prefixes = ("[系统任务", "[守护]", "[系统]", "[主动消息]", "【系统", "【守护")
+        changed = True
+        while changed and out:
+            changed = False
+            for p in prefixes:
+                if out.startswith(p):
+                    # 前缀可能带方括号对，截到同行末尾再往后跳。
+                    end = out.find("]\n")
+                    end2 = out.find("】\n")
+                    cut = max(end, end2)
+                    out = out[cut + 1:].strip() if cut >= 0 else out[len(p):].strip()
+                    changed = True
+                    break
+        if len(out) >= 2 and out[0] in "\"“「『" and out[-1] in "\"”」』":
+            out = out[1:-1].strip()
+        limit = ANNOUNCE_MAX_CHARS if max_chars is None else int(max_chars)
+        return out[:limit]
+
+    async def _llm_text(self, prompt: str, facts: dict[str, Any]) -> str:
+        """真正调用模型。上下文 = 人格 + 最近的对话历史。
+
+        为什么要带历史：不带的话模型会凭空捏造一个对话对象，甚至在消息里
+        接一句"你刚才说的那件事"。带上最近几轮，它才知道自己在跟谁说话、
+        当前话题是什么。
+
+        为什么要带人格：同一个模板套在毒舌人格和温柔人格上应该听不出是
+        同一句话——这正是"让 LLM 决定说什么"的意义所在。
+        """
+        ctx = self.context
+        if ctx is None:
+            return ""
+        # 只从 facts 里取地址，**不回头问内核**：这条路径可能正被内核
+        # 同步等着（睡前报备），再打一次 backend 调用会自己等自己。
+        # 调用方（轮询 / 内核报备）负责把 `umo` 填进 facts。
+        umo = str(facts.get("umo") or "")
+        if not umo:
+            logger.warning("[guardian] 主动消息没有可用会话地址，本次跳过")
+            return ""
+
+        system_prompt = await self._persona_prompt(umo)
+        history = await self._recent_history(umo)
+
+        try:
+            provider_id = ""
+            with contextlib.suppress(Exception):
+                provider_id = str(
+                    await ctx.get_current_chat_provider_id(umo=umo) or "")
+
+            gen = getattr(ctx, "llm_generate", None)
+            if callable(gen) and provider_id:
+                resp = await asyncio.wait_for(
+                    gen(chat_provider_id=provider_id, prompt=prompt,
+                        contexts=history, system_prompt=system_prompt),
+                    timeout=self.ANNOUNCE_LLM_TIMEOUT)
+                text = str(getattr(resp, "completion_text", "") or "")
+                if text.strip():
+                    return text.strip()
+                logger.warning("[guardian] llm_generate 返回空文本，尝试旧接口")
+            elif not callable(gen):
+                logger.info("[guardian] 当前 AstrBot 无 llm_generate，回退 text_chat")
+
+            provider = None
+            with contextlib.suppress(Exception):
+                provider = ctx.get_using_provider(umo=umo)
+            if provider is None:
+                logger.warning("[guardian] 没有可用的 LLM provider，本次跳过")
+                return ""
+            resp = await asyncio.wait_for(
+                provider.text_chat(prompt=prompt, contexts=history,
+                                   system_prompt=system_prompt),
+                timeout=self.ANNOUNCE_LLM_TIMEOUT)
+            return str(getattr(resp, "completion_text", "") or "").strip()
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[guardian] 主动消息生成超时（>{self.ANNOUNCE_LLM_TIMEOUT:.0f}s），本次跳过")
+            return ""
+        except Exception as e:  # noqa: BLE001 - 生成失败不该中断巡检
+            logger.warning(f"[guardian] 主动消息生成失败：{e}")
+            return ""
+
+    async def _persona_prompt(self, umo: str) -> str:
+        """取当前会话的人格设定，拿不到就用空串（不阻断生成）。"""
+        ctx = self.context
+        pm = getattr(ctx, "persona_manager", None)
+        if pm is None:
+            return ""
+        with contextlib.suppress(Exception):
+            pid = ""
+            get_conv = getattr(ctx, "conversation_manager", None)
+            if get_conv is not None:
+                cid = await get_conv.get_curr_conversation_id(umo)
+                if cid:
+                    conv = await get_conv.get_conversation(umo, cid)
+                    pid = str(getattr(conv, "persona_id", "") or "") if conv else ""
+            persona = None
+            if pid:
+                persona = await pm.get_persona(pid)
+            if persona is None:
+                get_default = getattr(pm, "get_default_persona_v3", None)
+                if callable(get_default):
+                    persona = await get_default(umo=umo)
+            if persona is None:
+                return ""
+            return str(getattr(persona, "system_prompt", "") or "")
+        return ""
+
+    async def _recent_history(self, umo: str, limit: int = 10) -> list[dict]:
+        """最近若干轮纯文本对话。
+
+        **必须清洗**：历史里可能带 `tool_calls` / `tool_call_id` / 图片等
+        非文本块，直接回灌会在部分严格校验的 provider 上报 400。这里只留
+        system / user / assistant 的纯文本，且把 `content` 强制成字符串。
+
+        拿不到历史不是错误——第一次主动开口时本来就可能没有历史。
+        """
+        ctx = self.context
+        cm = getattr(ctx, "conversation_manager", None)
+        if cm is None:
+            return []
+        with contextlib.suppress(Exception):
+            cid = await cm.get_curr_conversation_id(umo)
+            if not cid:
+                return []
+            conv = await cm.get_conversation(umo, cid)
+            raw = getattr(conv, "history", None) if conv else None
+            if isinstance(raw, str):
+                import json
+                raw = json.loads(raw) if raw.strip() else []
+            return self._sanitize_history(raw)[-limit:]
+        return []
+
+    @staticmethod
+    def _sanitize_history(raw: Any) -> list[dict]:
+        """只保留能安全回灌的纯文本轮次。"""
+        out: list[dict] = []
+        if not isinstance(raw, list):
+            return out
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            if role not in ("system", "user", "assistant"):
+                continue
+            content = item.get("content")
+            if isinstance(content, list):
+                # 多段内容只取文本段；图片/音频/文件一律丢弃。
+                parts = []
+                for seg in content:
+                    if isinstance(seg, dict):
+                        if str(seg.get("type") or "") == "text":
+                            parts.append(str(seg.get("text") or ""))
+                    elif isinstance(seg, str):
+                        parts.append(seg)
+                content = "".join(parts)
+            if not isinstance(content, str):
+                continue
+            content = content.strip()
+            if not content:
+                continue
+            out.append({"role": role, "content": content})
+        return out
+
+
 
     # ================================================================== #
     # IPC 事件 / 状态

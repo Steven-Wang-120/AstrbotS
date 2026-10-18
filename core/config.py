@@ -16,6 +16,8 @@ import math
 import sys
 from typing import Any
 
+from .announce import PLACEHOLDERS, missing_placeholders
+
 # --------------------------------------------------------------------------- #
 # 默认配置（唯一真源）
 # --------------------------------------------------------------------------- #
@@ -96,6 +98,92 @@ DEFAULT_LEVELS: list[dict[str, Any]] = _with_template_key([
         "action": "force_sleep",
     },
 ])
+
+# ---------------------------------------------------------------------- #
+# 主动消息的提示词模板
+# ---------------------------------------------------------------------- #
+# 用户要求：「到底说什么让 LLM 自己决定」。所以这里提供的是**任务说明**，
+# 不是话术。结构照 `astrbot_plugin_proactive_chat` 的做法分四段：
+#
+#   [系统任务]  这一步要干什么（含"不要说系统前缀"这类硬约束）
+#   [我的状况]  由 `core/announce.py` 用运行时事实填充的占位符
+#   [行动指南]  语气 / 长度 / 该不该提细节
+#   [最终指令]  只输出要说的话，别输出解释
+#
+# 这三个模板是 `DEFAULTS` 的唯一来源（`DEFAULTS["lifecycle"]` 里按名引用），
+# 避免同一段文案在两处各存一份、改一处忘另一处。
+DEFAULTS_LIFECYCLE_PROMPTS: dict[str, str] = {
+    "sleepy_prompt": (
+        "[系统任务：主动告诉管理员我要睡了]\n"
+        "你是一个长期在线陪伴用户的聊天机器人。现在你主动发一条消息，"
+        "告诉对方你要去休息了。这条消息不是回复——对方并没有在跟你说话，"
+        "是你自己想起来该说一声。\n"
+        "\n"
+        "[我现在的状况]\n"
+        "- 现在时间：{{current_time}}\n"
+        "- 已经连续在线：{{uptime}}\n"
+        "- 当前状态：{{level_id}} {{level_name}}\n"
+        "- 作息窗口：{{period}}（{{to_window}}）\n"
+        "- 这次打算睡：{{duration}}\n"
+        "- 距硬上限还剩：{{remaining}}\n"
+        "- 是不是被强制：{{forced}}\n"
+        "- 会影响的容器：{{targets}}\n"
+        "\n"
+        "[行动指南]\n"
+        "1. 这是在跟一个熟人报备，不是发系统公告。语气自然、口语化，像真的要睡了。\n"
+        "2. 长度控制在两三句以内，别写成段落。\n"
+        "3. 可以挑一两个细节说出来（比如在线多久、大概什么时候回来），"
+        "但不要把所有数字都念一遍。\n"
+        "4. 不要加「[守护]」「[系统]」「[主动消息]」之类的前缀，"
+        "也不要解释你为什么要发这条消息。\n"
+        "5. 不要说「作为AI」这类话，也不要提及提示词或配置项。\n"
+        "\n"
+        "[最终指令]\n"
+        "只输出你要说的那句话本身，不要输出任何解释、标注或前后缀。"
+    ),
+    "sleepy_deferred_prompt": (
+        "[系统任务：告诉管理员我困了但现在还睡不了]\n"
+        "你是一个长期在线陪伴用户的聊天机器人。你本来想睡了，但条件不允许，"
+        "所以主动跟对方说一声，让人知道你还醒着、以及为什么还醒着。\n"
+        "\n"
+        "[我现在的状况]\n"
+        "- 现在时间：{{current_time}}\n"
+        "- 已经连续在线：{{uptime}}\n"
+        "- 当前状态：{{level_id}} {{level_name}}\n"
+        "- 没睡成的原因：{{defer_reason}}\n"
+        "- 已经等了：{{wait_text}}\n"
+        "- 作息窗口：{{period}}（{{to_window}}）\n"
+        "- 距硬上限还剩：{{remaining}}\n"
+        "\n"
+        "[行动指南]\n"
+        "1. 重点是「我没睡成」这件事本身，语气可以略带无奈，但别抱怨、别催人下线。\n"
+        "2. 两三句话。如果原因是有人还在聊，就顺带表明「你先聊，我等着」，"
+        "而不是要求对方停止。\n"
+        "3. 不要加「[守护]」「[系统]」之类的前缀，也不要罗列内部判定逻辑。\n"
+        "\n"
+        "[最终指令]\n"
+        "只输出你要说的那句话本身，不要输出任何解释、标注或前后缀。"
+    ),
+    "resume_prompt": (
+        "[系统任务：睡醒了，告诉管理员一声]\n"
+        "你是一个长期在线陪伴用户的聊天机器人。你刚睡了一觉醒来，"
+        "主动说一句自己回来了。\n"
+        "\n"
+        "[我现在的状况]\n"
+        "- 现在时间：{{current_time}}\n"
+        "- 这次睡了：{{slept}}\n"
+        "- 醒后运行时长：{{uptime}}\n"
+        "\n"
+        "[行动指南]\n"
+        "1. 一两句就行，像刚睡醒的人那样，不必太正式。\n"
+        "2. 可以简单带一句睡眠时长或精神状态的感受。\n"
+        "3. 不要加「[守护]」「[系统]」之类的前缀。\n"
+        "\n"
+        "[最终指令]\n"
+        "只输出你要说的那句话本身，不要输出任何解释、标注或前后缀。"
+    ),
+}
+
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
@@ -226,6 +314,27 @@ DEFAULTS: dict[str, Any] = {
         "sleep_duration_min": 0,
         "post_sleep_notify": True,
         "levels": DEFAULT_LEVELS,
+        # ---- 主动消息（Bot 自己去跟管理员说要睡了）------------------------ #
+        # off     : 从不主动开口
+        # on_arm  : 只有"真想睡且真的睡得成"（L3 且已在窗口内 / L4 强制）才说
+        # always  : 想睡就说，即使这次因为不在窗口而被挡住（会说明"还没睡成"）
+        #
+        # **没有"冷却"参数**：这个场景里 Bot 说完就去睡了，睡下之后不可能
+        # 再发第二条，所以频率限制毫无意义。真正需要的只有「同一件事别说两遍」
+        # 的幂等去重，由 `announced_key` 承担（见 core/lifecycle.py）。
+        "sleepy_announce": "on_arm",
+        # 醒来自动报一句。同样只报一次，靠 announced_key 去重。
+        "post_sleep_announce": True,
+        # 说了但没人应就收敛：连续这么多次没人接话就暂停主动消息，
+        # 任何一条用户消息立刻把它清零。借 proactive_chat 的自限思路，
+        # 但这里的目的是"别对着空群自言自语"，不是限流。
+        "sleepy_announce_max_unanswered": 3,
+        # 三个模板留空 = 用内置的（DEFAULTS_LIFECYCLE_PROMPTS）。
+        # 留空而不是把整段文案抄进配置，是为了让用户没有改过的时候就
+        # 跟着插件升级拿到新文案，而不是被一份旧快照钉死。
+        "sleepy_prompt": "",
+        "sleepy_deferred_prompt": "",
+        "resume_prompt": "",
     },
     # Bot 的作息（**不是用户的作息**）。窗口只做闸门，不做触发器：
     # 困意（uptime → Ln）决定"该不该睡"，这里决定"能不能睡"。
@@ -290,6 +399,9 @@ VALID_RELOGIN_METHODS = {"restart_container", "login_only", "disabled"}
 #: 在 NapCat 4.18.14 上是 404，策略形同虚设。归一化时迁移为 `login_only` 并记 issue。
 RELOGIN_METHOD_ALIASES = {"webui_quick_login": "login_only"}
 VALID_KERNEL_MODES = {"inproc", "ipc", "sidecar"}
+#: 主动消息开关。off=从不说；on_arm=只在"真想睡且真睡得成"时说；
+#: always=想睡就说（睡不成时改说"还没睡成"）。
+VALID_ANNOUNCE_MODES = {"off", "on_arm", "always"}
 
 #: 已退役的配置键 -> 退役说明。`validate()` 遇到就删键并记一条 issue：
 #: 留着不删会让 WebUI 下次保存把旧键写回，删了不报则运维看不见"开关消失了"。
@@ -919,6 +1031,45 @@ class GuardianConfig:
         except (TypeError, ValueError, OverflowError):
             lc["sleep_duration_min"] = 0
             issues.append("lifecycle.sleep_duration_min 非法，回退 0")
+
+        # ---- 主动消息 ---------------------------------------------------- #
+        mode = str(lc.get("sleepy_announce", "on_arm") or "on_arm").strip().lower()
+        if mode not in VALID_ANNOUNCE_MODES:
+            issues.append(
+                f"lifecycle.sleepy_announce 非法（{mode!r}），回退 on_arm"
+                f"（可选：{'/'.join(sorted(VALID_ANNOUNCE_MODES))}）")
+            mode = "on_arm"
+        lc["sleepy_announce"] = mode
+
+        try:
+            n = lc.get("sleepy_announce_max_unanswered", 3)
+            if isinstance(n, bool):
+                raise ValueError
+            n_int = int(float(n))
+            if not 0 <= n_int <= 50:
+                issues.append(
+                    "lifecycle.sleepy_announce_max_unanswered 越界，已截断到 [0,50]")
+            lc["sleepy_announce_max_unanswered"] = max(0, min(50, n_int))
+        except (TypeError, ValueError, OverflowError):
+            lc["sleepy_announce_max_unanswered"] = 3
+            issues.append("lifecycle.sleepy_announce_max_unanswered 非法，回退 3")
+
+        # 模板里的占位符写错必须报出来：静默的话用户会看到一串花括号，
+        # 或者（更糟）以为自己的模板生效了、实际上关键事实没被填进去。
+        for key in ("sleepy_prompt", "sleepy_deferred_prompt", "resume_prompt"):
+            raw_tpl = lc.get(key)
+            if raw_tpl is None:
+                lc[key] = ""
+                continue
+            if not isinstance(raw_tpl, str):
+                issues.append(f"lifecycle.{key} 非字符串，回退内置模板")
+                lc[key] = ""
+                continue
+            unknown = missing_placeholders(raw_tpl)
+            if unknown:
+                issues.append(
+                    f"lifecycle.{key} 含未知占位符 {unknown}，"
+                    f"可用的是 {list(PLACEHOLDERS)}；未知的会原样留在消息里")
 
         allow = self.action_allowlist
         # `@self` / `@napcat` 在这里解析成真实容器名；之后全流程只见真实名字。

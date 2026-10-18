@@ -16,9 +16,10 @@ from ..actions.base import get_action
 from ..notify.notifier import Notifier
 from ..utils.textutil import fmt_ts, human_duration, status_icon
 from . import registry  # noqa: F401  触发探针注册
+from .announce import SleepyFacts, now_text
 from .audit import AuditLog
 from .bus import EventBus
-from .config import GuardianConfig
+from .config import DEFAULTS_LIFECYCLE_PROMPTS, GuardianConfig
 from .lifecycle import LifecyclePolicy, LifecycleState, drowsy_visible
 from .log import logger
 from .models import (
@@ -413,6 +414,311 @@ class HealthEngine:
         if lead <= 0:
             return now
         return now + lead * 60.0
+
+    # ================================================================== #
+    # 主动消息：Bot 自己去跟管理员说要睡了
+    # ================================================================== #
+    # 分工：
+    #   - 这里只回答「现在该不该开口」+ 「要告诉模型哪些事实」；
+    #   - 「具体怎么说」由适配层 `compose_announce()` 调 LLM 生成。
+    #
+    # 内核进程不持有 provider 凭据、也不 import astrbot（I6），所以它不能
+    # 自己调模型。这个边界不是洁癖：`kernel.mode=ipc` 时内核是独立进程，
+    # 让它去要凭据等于把 LLM 配置复制一份到内核侧，且一旦 provider 不可用
+    # 内核会被网络超时卡住。
+    #
+    # **没有冷却参数**：Bot 说完就去睡，睡下后不可能再发第二条，频率限制
+    # 在这个场景里没有约束对象。要防的只有"同一件事说两遍"，用事件键去重。
+    ANNOUNCE_KINDS = ("sleep", "deferred", "resume")
+    ANNOUNCE_DEFAULT_MAX_UNANSWERED = 3
+
+    def announce_config(self) -> dict[str, Any]:
+        """主动消息的有效配置（含模板回退），供适配层与状态展示使用。"""
+        raw = self.config.get("lifecycle")
+        lc = raw if isinstance(raw, dict) else {}
+
+        mode = str(lc.get("sleepy_announce", "on_arm") or "on_arm").strip().lower()
+        if mode not in ("off", "on_arm", "always"):
+            mode = "on_arm"
+
+        try:
+            max_unanswered = int(lc.get("sleepy_announce_max_unanswered",
+                                        self.ANNOUNCE_DEFAULT_MAX_UNANSWERED))
+        except (TypeError, ValueError):
+            max_unanswered = self.ANNOUNCE_DEFAULT_MAX_UNANSWERED
+        # 0 / 负数 = 不设限（用户显式关掉自限）。上限 50 只为防手滑填个天文数字。
+        max_unanswered = max(0, min(50, max_unanswered))
+
+        # 模板留空 -> 用内置。用户没改过就跟着插件升级拿到新文案，
+        # 而不是被一份早期快照钉死。
+        prompts: dict[str, str] = {}
+        for key, default in DEFAULTS_LIFECYCLE_PROMPTS.items():
+            value = lc.get(key)
+            text = str(value).strip() if isinstance(value, str) else ""
+            prompts[key] = text or default
+
+        return {
+            "mode": mode,
+            "post_sleep": bool(lc.get("post_sleep_announce", True)),
+            "max_unanswered": max_unanswered,
+            "prompts": prompts,
+        }
+
+    def peer_stats(self) -> dict[str, Any]:
+        """该报备给谁。
+
+        不做任何对话内容解析（P1）：只看消息来自哪个会话，以及发送者是不是
+        管理员。适配层在 `note_event()` 里写这两个值，这里只读。
+
+        优先级：管理员 > 最近说话的人 > `notify.umo_list[0]`。
+        管理员的写入绕过 10 秒合并窗口，否则同一时段群里有人说话就会把
+        地址覆盖掉，报备消息会发给一个普通群友。
+        """
+        for key in ("announce.admin_umo", "announce.last_umo"):
+            value = self.state.get(key)
+            if isinstance(value, str) and value.strip():
+                return {
+                    "umo": value.strip(),
+                    "place": str(self.state.get(key.replace("_umo", "_place")) or ""),
+                    "count": int(self.state.get("announce.unanswered") or 0),
+                    "from_admin": key == "announce.admin_umo",
+                }
+        # 兜底：用户配了 notify.umo_list 就直接用它（老部署的既有行为）。
+        raw = self.config.get("notify")
+        if isinstance(raw, dict):
+            targets = raw.get("umo_list") or []
+            if isinstance(targets, str):
+                targets = [targets]
+            for t in targets:
+                if isinstance(t, str) and t.strip():
+                    return {"umo": t.strip(), "place": "", "count": 0,
+                            "from_admin": False}
+        return {"umo": "", "place": "", "count": 0, "from_admin": False}
+
+    def unanswered_count(self) -> int:
+        try:
+            return max(0, int(self.state.get("announce.unanswered") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def note_unanswered(self, answered: bool = False) -> int:
+        """更新"说了但没人应"的累计数。返回更新后的值。
+
+        `answered=True` 是任何一条用户消息到达时调用的：立刻清零。
+        否则"昨晚连说三次没人理"会一直挂着，今天有人说话了反而继续沉默。
+        """
+        value = 0 if answered else min(999, self.unanswered_count() + 1)
+        self.state.set("announce.unanswered", value)
+        return value
+
+    def announce_state(self) -> dict[str, Any]:
+        """运维视角的主动消息状态：说了没、什么时候说的、被什么挡过。"""
+        st = self.lifecycle_state
+        cfg = self.announce_config()
+        return {
+            "mode": cfg["mode"],
+            "post_sleep": cfg["post_sleep"],
+            "max_unanswered": cfg["max_unanswered"],
+            "unanswered": self.unanswered_count(),
+            "announced_key": st.announced_key,
+            "announced_at": st.announced_at,
+            "announced_at_text": (
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(st.announced_at))
+                if st.announced_at else ""),
+            "peer": self.peer_stats(),
+        }
+
+    def _announce_key(self, facts: dict[str, Any]) -> str:
+        """把一次"事件"折叠成一个稳定标识，用于"这件事说过了吗"。
+
+        粒度取整到小时：同一等级下 uptime 每涨一小时才算新的一轮。
+        如果取精确值，L3 报备之后每 120 秒轮询都会算出不同的键，去重失效；
+        如果只取等级，管理员推迟一次之后又不肯再说第二次。
+        """
+        kind = str(facts.get("kind") or "")
+        if kind == "resume":
+            # 醒来事件天然唯一：绑在"上次入睡时刻"上。
+            return f"resume:{int(self.lifecycle_state.last_sleep_at)}"
+        level = str(facts.get("level_id") or "")
+        if kind == "deferred":
+            # 顺延事件按"顺延起点"折叠：同一次顺延只报一次。
+            since = int(self.lifecycle_state.deferred_since or 0)
+            return f"deferred:{level}:{since}"
+        uptime_h = float(facts.get("uptime_hours") or 0.0)
+        return f"sleep:{level}:{int(uptime_h)}"
+
+    def claim_announce(self, key: str, *, now: float | None = None) -> bool:
+        """占用"这件事我要说了"的标记。已占用则返回 False。
+
+        **必须在 LLM 生成成功之后调用**，不能在算出 facts 时就调用：
+        否则一次网络超时就把这一轮的事件键烧掉，接下来一小时都不会再试。
+        """
+        if not key:
+            return False
+        st = self.lifecycle_state
+        if st.announced_key == key:
+            return False
+        st.announced_key = key
+        st.announced_at = time.time() if now is None else float(now)
+        self.state.set("lifecycle.state", st.to_dict())
+        return True
+
+    def sleepy_facts(self, now: float | None = None) -> dict[str, Any] | None:
+        """现在该不该说"我要睡了"，以及要说清哪些事实。
+
+        返回 `None` 表示这次不开口。返回的字典里带 `template_key`，
+        适配层据此挑模板；模板本体从 `announce_config()` 取。
+
+        只读：不改任何状态。占坑由调用方在 LLM 成功后 `claim_announce()`。
+
+        三条闸门（顺序不可换）：
+
+        1. `mode == off`               -> 不说
+        2. 等级动作必须是 arm_sleep / force_sleep -> 否则不说
+           （困意是 uptime 的函数，不是时钟的函数；L0-L2 不该喊困）
+        3. `on_arm` 模式下必须"真睡得成"：窗口内、或顺延超限、或强制
+           -> 否则不说（`always` 模式下改成说"还没睡成"，走 deferred）
+        """
+        cfg = self.announce_config()
+        if cfg["mode"] == "off":
+            return None
+
+        res = self._last_results.get("uptime:system")
+        if res is None or res.status != Status.OK:
+            # uptime 不可信就不开口：宁可这一轮沉默，也不拿 0 小时去说
+            # "我连续在线 0 小时，要睡了"。
+            return None
+        uptime_h = float(res.metrics.get("uptime_hours", 0.0) or 0.0)
+        moment = time.time() if now is None else float(now)
+
+        idx, spec = self.lifecycle_policy.resolve_level(uptime_h)
+        action = str(getattr(spec, "action", "") or "none")
+        # 只有 arm_sleep / force_sleep 才可能喊困。L1/L2 是 notify，
+        # 它们靠 `lifecycle.inject_prompt` 在对话里渗透，不走主动消息。
+        if action not in ("arm_sleep", "force_sleep"):
+            return None
+
+        enabled, start, end, _ = self._circadian_cfg()
+        in_win = self.in_asleep_window(moment)
+        forced = action == "force_sleep"
+        deferred_too_long = self._deferred_too_long(moment)
+        recent_talk = self._recent_talk(moment)
+
+        # 真正睡得成的三个条件。`forced` 不看窗口：L4 已到硬上限，
+        # 窗口让不让睡都得睡，这时候报备不能因为"现在不是凌晨"就不说。
+        can_sleep = forced or deferred_too_long or (in_win and not recent_talk)
+
+        if not can_sleep:
+            if cfg["mode"] != "always":
+                return None
+            return self._deferred_facts(moment, cfg, spec, uptime_h, idx,
+                                        in_win=in_win, recent_talk=recent_talk)
+
+        hours_to_window = 0.0
+        if enabled and not in_win:
+            lead_min = minutes_until_window(moment, start, end, self._tz_offset_h())
+            hours_to_window = max(0.0, lead_min / 60.0)
+
+        facts = SleepyFacts(
+            kind="sleep",
+            level_id=str(getattr(spec, "id", "") or ""),
+            level_name=str(getattr(spec, "name", "") or ""),
+            uptime_hours=uptime_h,
+            now_text=now_text(moment, self._tz_offset_h()),
+            period=f"{start} - {end}" if enabled else "",
+            hours_to_window=hours_to_window,
+            in_window=in_win,
+            duration_min=int(self.config.lifecycle.sleep_duration_min or 0),
+            targets=tuple(self.config.lifecycle.sleep_targets or ()),
+            remaining_hours=self._remaining_hours(uptime_h),
+            forced=forced,
+            recent_talk=recent_talk,
+            reason=(f"等级 {getattr(spec, 'id', '')} 动作={action}"
+                    + ("；已在硬上限，强制执行" if forced else "")
+                    + ("" if in_win else "；窗口外但顺延已超限")),
+        )
+        data = facts.to_dict()
+        data["template_key"] = "sleepy_prompt"
+        data["event_key"] = self._announce_key(data)
+        return data
+
+    def _deferred_facts(self, moment: float, cfg: dict[str, Any], spec: Any,
+                        uptime_h: float, idx: int, *,
+                        in_win: bool, recent_talk: bool) -> dict[str, Any]:
+        """`always` 模式专用：想睡但这次睡不成，说一声自己还醒着。"""
+        enabled, start, end, _ = self._circadian_cfg()
+        hours_to_window = 0.0
+        if enabled and not in_win:
+            lead_min = minutes_until_window(moment, start, end, self._tz_offset_h())
+            hours_to_window = max(0.0, lead_min / 60.0)
+
+        since = float(self.lifecycle_state.deferred_since or 0.0)
+        wait_hours = max(0.0, (moment - since) / 3600.0) if since else 0.0
+
+        facts = SleepyFacts(
+            kind="deferred",
+            level_id=str(getattr(spec, "id", "") or ""),
+            level_name=str(getattr(spec, "name", "") or ""),
+            uptime_hours=uptime_h,
+            now_text=now_text(moment, self._tz_offset_h()),
+            period=f"{start} - {end}" if enabled else "",
+            hours_to_window=hours_to_window,
+            in_window=in_win,
+            duration_min=int(self.config.lifecycle.sleep_duration_min or 0),
+            targets=tuple(self.config.lifecycle.sleep_targets or ()),
+            remaining_hours=self._remaining_hours(uptime_h),
+            forced=False,
+            defer_reason=self._defer_sleep_reason(moment, in_win=in_win,
+                                                  recent_talk=recent_talk),
+            wait_hours=wait_hours,
+            recent_talk=recent_talk,
+            reason=f"等级 {getattr(spec, 'id', '')} 已想睡，但本次被顺延",
+        )
+        data = facts.to_dict()
+        data["template_key"] = "sleepy_deferred_prompt"
+        data["event_key"] = self._announce_key(data)
+        return data
+
+    def resume_facts(self, now: float | None = None) -> dict[str, Any] | None:
+        """睡醒了，该不该报一句"我回来了"。只读。"""
+        cfg = self.announce_config()
+        if cfg["mode"] == "off" or not cfg["post_sleep"]:
+            return None
+
+        last_sleep = float(self.lifecycle_state.last_sleep_at or 0.0)
+        if last_sleep <= 0:
+            return None
+        moment = time.time() if now is None else float(now)
+
+        # 太旧的不报：插件重载后把三天前那次睡眠翻出来说"我醒了"会很怪。
+        slept_minutes = int(max(0.0, (moment - last_sleep) / 60.0))
+        if slept_minutes > 6 * 60:
+            return None
+
+        res = self._last_results.get("uptime:system")
+        uptime_h = 0.0
+        if res is not None and res.status == Status.OK:
+            uptime_h = float(res.metrics.get("uptime_hours", 0.0) or 0.0)
+
+        facts = SleepyFacts(
+            kind="resume",
+            level_id=str(self.lifecycle_state.level_id or ""),
+            level_name=str(self.lifecycle_state.level_name or ""),
+            uptime_hours=uptime_h,
+            now_text=now_text(moment, self._tz_offset_h()),
+            slept_minutes=slept_minutes,
+            reason=f"上次入睡于 {time.strftime('%m-%d %H:%M', time.localtime(last_sleep))}",
+        )
+        data = facts.to_dict()
+        data["template_key"] = "resume_prompt"
+        data["event_key"] = self._announce_key(data)
+        return data
+
+    def _remaining_hours(self, uptime_h: float) -> float | None:
+        try:
+            return float(self.lifecycle_policy.remaining_to_deadline(uptime_h))
+        except Exception:  # noqa: BLE001 - 展示用数字，算不出就当未知
+            return None
 
     async def _lifecycle_tick(self, trigger: str) -> None:
         res = self._last_results.get("uptime:system")

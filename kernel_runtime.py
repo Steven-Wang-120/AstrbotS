@@ -57,6 +57,9 @@ DEFAULT_DATA_DIR_ENV = "GUARDIAN_DATA_DIR"
 
 Sender = Callable[[str, str], Awaitable[None]]
 ActionCaller = Callable[[str], Awaitable[Any]]
+#: 把"事实"说成人话。由适配层注入（内部调 LLM），内核自己绝不 import astrbot。
+#: 入参是 `engine.sleepy_facts()` / `resume_facts()` 的返回字典。
+Composer = Callable[[dict[str, Any]], Awaitable[str]]
 
 
 def default_data_dir() -> str:
@@ -81,6 +84,9 @@ class GuardianKernel:
 
         self._sender = sender
         self._action_caller = action_caller
+        #: 主动消息的文本生成器（见 `set_announce_composer`）。`None` = 无生成
+        #: 能力，睡前报备退化为"只报事实"的兜底文本。
+        self._announce_composer: Composer | None = None
 
         # 数据目录迁移（B16 §7 / §9 M4）：内核独立后，业务状态要从 AstrBot 的插件
         # 数据目录搬到内核可见的共享卷。幂等、只复制不删除、留 `.migrated` 标记。
@@ -354,9 +360,109 @@ class GuardianKernel:
     async def request_sleep(self, reason: str, duration_min: int = 0, *,
                             actor: str = "llm", trigger: str = "llm",
                             bypass_confirm: bool = False) -> tuple[bool, str]:
+        # ---- 睡前报备 -------------------------------------------------- #
+        # 只在**自主来源**上做（生命周期等级推进 / 硬上限）：只有这两种情况
+        # 用户事先不知道、且会突然发现 bot 不见了。管理员手动 sleep 有命令
+        # 回执、cron 维护重启写在配置里，都不需要再报备一句。
+        #
+        # 为什么必须在**内核这一层**做：真正决定"要睡了"的是这一次 tick，
+        # 适配层的 120 秒轮询可能刚好错过窗口。放在这里才能保证"说了就睡"。
+        #
+        # 整体吞异常：报备是礼貌，不是前置条件。让一次 LLM 超时挡住 30 天
+        # 硬上限的强制睡眠，比"没说一声"严重得多。
+        if actor == "lifecycle" and trigger in ("level", "deadline"):
+            try:
+                await self._announce_before_sleep(reason)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[guardian] 睡前报备失败（不影响睡眠）：{exc}")
+
         return await self.engine.request_sleep(
             reason, duration_min, actor=actor, trigger=trigger,
             bypass_confirm=bypass_confirm)
+
+    def set_announce_composer(self, composer: Composer | None) -> None:
+        """注入"把事实说成人话"的能力（由适配层提供，内部调 LLM）。
+
+        为什么用注入而不是让内核自己调模型：
+
+        - **I6**：`core/` 与内核进程不得 `import astrbot`，provider 凭据只在
+          适配层手里；
+        - **可用性**：内核若直连模型，一次网络抖动会把巡检循环和睡眠路径
+          一起卡住；注入的函数由适配层控制超时与降级；
+        - **回滚**：`kernel.mode=ipc` 时这里天然是 `None`，行为退化为
+          "不主动说话"，而不是崩掉。
+
+        与 `set_sender` 同样是延迟绑定：`inproc` 模式下适配层构造完内核再注入。
+        """
+        self._announce_composer = composer
+
+    async def _announce_before_sleep(self, reason: str) -> None:
+        """在真睡眠之前让 bot 自己开口说一声。"""
+        facts = self.sleepy_facts()
+        if not facts:
+            return
+        key = str(facts.get("event_key") or "")
+        if key and key == self.lifecycle_state.announced_key:
+            return
+        umo = self._announce_umo()
+        if not umo:
+            logger.info("[guardian] 睡前报备跳过：没有可用的会话地址")
+            return
+
+        # 先占坑再生成：这一段在**睡眠之前**执行，重复说一遍比"生成成功但
+        # 并发重入又发一次"更糟；而且这里是单次机会，不存在"失败了下一轮
+        # 再试"——下一轮 bot 已经睡下了。
+        if key and not self.engine.claim_announce(key):
+            return
+
+        facts["umo"] = umo
+        text = ""
+        composer = self._announce_composer
+        if composer is not None:
+            text = str(await composer(facts) or "")
+        if not text:
+            # 没有生成能力（ipc 模式）或生成失败：退回到"只有事实"的一句
+            # 兜底。这不是话术设计，是**告知义务的下限**——总比一声不响消失好。
+            text = self._facts_only_text(facts)
+
+        try:
+            await self._send(umo, text)
+            self.audit.append(kind="announce.sent", target=str(facts.get("kind") or ""),
+                              detail=f"{key} | {text[:120]}", ok=True,
+                              actor="lifecycle", trigger="sleep")
+            logger.info(f"[guardian] 睡前报备已发送（{umo}）：{text}")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[guardian] 睡前报备发送失败：{exc}")
+
+    def _facts_only_text(self, facts: dict[str, Any]) -> str:
+        """无 LLM 时的最小事实兜底。
+
+        刻意写得像"电报"而不是像"人话"：它只在模型不可用时出现，读者
+        应该一眼看出这是降级输出，而不是以为 bot 突然换了说话方式。
+        """
+        parts = [f"{facts.get('now_text') or ''}"]
+        if facts.get("kind") == "resume":
+            parts.append(f"刚睡了 {facts.get('slept_minutes', 0)} 分钟，回来了。")
+        else:
+            parts.append(f"连续在线 {facts.get('uptime_hours', 0):.0f} 小时，"
+                         f"{facts.get('level_id', '')} {facts.get('level_name', '')}，"
+                         f"现在要睡一下。")
+            dur = int(facts.get("duration_min") or 0)
+            if dur:
+                parts.append(f"约 {dur} 分钟。")
+        return "".join(p for p in parts if p).strip()
+
+    def _announce_umo(self) -> str:
+        """报备收件人：管理员 > 最近说话的人 > notify.umo_list[0]。"""
+        for key in ("announce.admin_umo", "announce.last_umo"):
+            value = self.state.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for t in (self.config.notify.umo_list or []):
+            if isinstance(t, str) and t.strip():
+                return t.strip()
+        return ""
+
 
     async def _dispatch(self, spec: ActionSpec) -> tuple[bool, str]:
         decision = self.safety.authorize(spec)
@@ -427,6 +533,30 @@ class GuardianKernel:
 
     def sleep_armed(self) -> bool:
         return bool(self.engine.lifecycle_state.sleep_armed)
+
+    # ------------------------------------------------------------------ #
+    # 主动消息（转交 engine；内核对外只暴露这一层，适配层不碰 engine）
+    # ------------------------------------------------------------------ #
+    def announce_config(self) -> dict[str, Any]:
+        return self.engine.announce_config()
+
+    def sleepy_facts(self, now: float | None = None) -> dict[str, Any] | None:
+        return self.engine.sleepy_facts(now=now)
+
+    def resume_facts(self, now: float | None = None) -> dict[str, Any] | None:
+        return self.engine.resume_facts(now=now)
+
+    def peer_stats(self) -> dict[str, Any]:
+        return self.engine.peer_stats()
+
+    def announce_state(self) -> dict[str, Any]:
+        return self.engine.announce_state()
+
+    def claim_announce(self, key: str, now: float | None = None) -> bool:
+        return self.engine.claim_announce(key, now=now)
+
+    def note_unanswered(self, answered: bool = False) -> int:
+        return self.engine.note_unanswered(answered=answered)
 
     def level_prompt(self) -> str:
         """当前等级注入提示词（`on_llm_request` 注入源）。"""
@@ -624,10 +754,32 @@ class GuardianKernel:
             raise RuntimeError("未注入通知发送器（域 B 负责投递）")
         await self._sender(umo, text)
 
-    def note_event(self) -> None:
-        """由适配层在收到任意消息时调用（供 QQ 活跃度证据）。"""
+    def note_event(self, umo: str = "", is_admin: bool = False,
+                   place: str = "") -> None:
+        """由适配层在收到任意消息时调用（供 QQ 活跃度证据）。
+
+        **只记"谁在哪个会话发过言"，从不接触消息内容**（P1 / B15 §6）。
+        `umo` 是 AstrBot 的会话标识，`is_admin` 由适配层按管理员名单判定
+        ——适配层本来就持有那份名单，内核不该再维护一份。
+
+        为什么要记地址：`notify.umo_list` 在很多部署里是空的，主动消息就
+        没有收件人（历史行为是退化成一行 `notify.no_target` 日志）。用最近
+        一次真实会话当收件人比让用户手填 UMO 可靠得多，也不需要读内容。
+
+        管理员的消息**绕过合并窗口**：见 `adapter_runtime.note_event`。
+        """
         self.state.set("last_event_ts", time.time())
         self.state.set("last_event_age", 0.0)
+        if isinstance(umo, str) and umo.strip():
+            self.state.set("announce.last_umo", umo.strip()[:200])
+            if isinstance(place, str) and place.strip():
+                self.state.set("announce.last_place", place.strip()[:16])
+            if is_admin:
+                # 管理员地址单独存一份且不覆盖：报备消息优先发给管理员，
+                # 不能被随后进来的普通群友覆盖掉。
+                self.state.set("announce.admin_umo", umo.strip()[:200])
+                if isinstance(place, str) and place.strip():
+                    self.state.set("announce.admin_place", place.strip()[:16])
 
     # ================================================================== #
     # 宿主看门狗自检 / 自动安装

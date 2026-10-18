@@ -467,6 +467,48 @@
         "type": "bool",
         "default": true
       },
+      "sleepy_announce": {
+        "description": "主动消息：Bot 自己去跟管理员说一声要睡了",
+        "type": "string",
+        "default": "on_arm",
+        "options": ["off", "on_arm", "always"],
+        "option_labels": {
+          "off": "关闭",
+          "on_arm": "只在真睡得成时说（推荐）",
+          "always": "想睡就说（睡不成也会说一声）"
+        },
+        "hint": "只在 L3 准备睡眠 / L4 强制睡眠时才可能开口。L1、L2 靠对话里的提示词渗透，不走主动消息。"
+      },
+      "post_sleep_announce": {
+        "description": "睡醒后主动说一句「我回来了」",
+        "type": "bool",
+        "default": true,
+        "hint": "只报一次，靠事件键去重；超过 6 小时前的那次睡眠不再补报。"
+      },
+      "sleepy_announce_max_unanswered": {
+        "description": "连续多少次没人回应就暂停主动消息（0 = 不限制）",
+        "type": "int",
+        "default": 3,
+        "hint": "任何一条用户消息都会立刻把这个计数清零。"
+      },
+      "sleepy_prompt": {
+        "description": "主动消息提示词（准备睡）——留空则使用内置",
+        "type": "text",
+        "default": "",
+        "hint": "可用占位符：{{current_time}} {{uptime}} {{level_id}} {{level_name}} {{remaining}} {{duration}} {{targets}} {{period}} {{to_window}} {{defer_reason}} {{wait_text}} {{slept}} {{forced}} {{reason}}。写错的花括号会原样留在消息里。"
+      },
+      "sleepy_deferred_prompt": {
+        "description": "主动消息提示词（想睡但还没睡成）——留空则使用内置",
+        "type": "text",
+        "default": "",
+        "hint": "仅在 sleepy_announce=always 时使用。占位符同上。"
+      },
+      "resume_prompt": {
+        "description": "主动消息提示词（睡醒回来）——留空则使用内置",
+        "type": "text",
+        "default": "",
+        "hint": "占位符同上。留空 = 跟着插件升级拿到新文案。"
+      },
       "levels": {
         "description": "等级表（按运行时长分级，每级注入不同提示词）",
         "type": "template_list",
