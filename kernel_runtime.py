@@ -37,6 +37,7 @@ from .core.policy import PolicyEngine
 from .core.safety import SafetyGuard
 from .core.scheduler import Scheduler
 from .core.state import StateStore
+from .core.timefmt import clamp_tz_offset, describe, describe_uptime
 from .notify.notifier import Notifier
 from .utils.dockerclient import DockerClient
 from .utils.migration import migrate_legacy_data, resolve_legacy_data_dir
@@ -440,14 +441,45 @@ class GuardianKernel:
             "</guardian_status>"
         )
 
+    def _tz_offset_h(self) -> float:
+        """本地时区偏移（小时，东正西负）。
+
+        只读 `state["env.tz_offset_h"]`——由 `env_platform` 探针算好后落盘
+        （`engine._persist_tz_offset()`）。**不要**在这里调探针：`llm_injection`
+        是每轮对话都走的最热路径，而探针要读 `/proc`、跑 `platform`、查 `zoneinfo`。
+
+        缺失时兜底 `+8.0`：这个项目的部署目标是中国时区（compose 里
+        `TZ=${TZ:-Asia/Shanghai}`），而且"稍微偏几小时"远好过"每秒重算一次"。
+        """
+        value = self.state.get("env.tz_offset_h")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 8.0
+        return clamp_tz_offset(float(value))
+
     def llm_injection(self) -> dict[str, Any]:
         """一次调用返回 LLM 注入所需的全部素材。
 
         注入发生在**每次** LLM 请求上，是最热路径；拆成多次 IPC 往返会让每次
         对话都多付几次往返延迟。所以这里合成一次调用。
+
+        块顺序固定为 `<guardian_time>` → `<lifecycle_guard>` → `<guardian_status>`：
+        先给"现在是什么时候"这个客观锚点，再给"我现在状态如何"，最后才是系统健康。
+        顺序反了模型容易把"运行了 8 天"读成"现在很晚"。
         """
         blocks: list[str] = []
         level = ""
+        period = ""
+
+        if self.config.lifecycle.enabled:
+            tz_offset = self._tz_offset_h()
+            text, period = describe(time.time(), tz_offset)
+            uptime = self.engine.lifecycle_state.uptime_hours
+            lines = ["<guardian_time>", f"现在：{text}"]
+            if isinstance(uptime, (int, float)) and uptime > 0:
+                lines.append(f"已连续运行：{describe_uptime(float(uptime))}")
+            lines.append("</guardian_time>")
+            blocks.append("\n".join(lines))
+
         prompt = self.level_prompt()
         if self.config.lifecycle.enabled and prompt:
             level = str(self.state.get("lifecycle.inject_level") or "")
@@ -461,6 +493,8 @@ class GuardianKernel:
             "text": "\n".join(blocks),
             "mode": str(self.config.lifecycle.inject_mode or "extra_user_content"),
             "level": level,
+            # M3 用它判断"在不在窗口内"；这里只透传，判定在 engine 里做
+            "period": period,
         }
 
     def lifecycle_status_text(self) -> str:
