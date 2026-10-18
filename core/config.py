@@ -19,7 +19,35 @@ from typing import Any
 # --------------------------------------------------------------------------- #
 # 默认配置（唯一真源）
 # --------------------------------------------------------------------------- #
-DEFAULT_LEVELS: list[dict[str, Any]] = [
+# --------------------------------------------------------------------------- #
+# 等级模板键（`template_list` 的条目类型标识）
+# --------------------------------------------------------------------------- #
+# AstrBot 的 `template_list` 里，每个条目都必须带一个 `__template_key`，指回
+# `_conf_schema.json` 中 `templates.<key>` 的定义。前端靠它：
+#   - 决定标题显示哪个模板名（`templateLabel(entry.__template_key)`）
+#   - 决定这一条渲染哪些字段（`getTemplate(entry)` 取不到就整条报警）
+# 后端靠它：保存时逐条校验（`config_service._validate_template_list`，缺了直接
+# 拒绝保存）。它**不是**我们的业务字段，而是一个面向 WebUI 的寄宿标记；我们的
+# 运行时代码从不读它（`validate()` 重建等级对象时会丢掉它）。
+#
+# 少了它就会出现"未指定模板 / 找不到对应模板，请删除后重新添加"——条目数据
+# 其实完好无损，只是前端不知道该怎么渲染。
+LEVEL_TEMPLATE_KEY = "level"
+
+
+def _with_template_key(levels: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """给等级列表补上 `__template_key`（已存在的不动，保持幂等）。"""
+    out: list[dict[str, Any]] = []
+    for lv in levels:
+        if not isinstance(lv, dict):
+            continue
+        entry = dict(lv)
+        entry.setdefault("__template_key", LEVEL_TEMPLATE_KEY)
+        out.append(entry)
+    return out
+
+
+DEFAULT_LEVELS: list[dict[str, Any]] = _with_template_key([
     {
         "id": "L0",
         "name": "常规",
@@ -67,7 +95,7 @@ DEFAULT_LEVELS: list[dict[str, Any]] = [
         ),
         "action": "force_sleep",
     },
-]
+])
 
 DEFAULTS: dict[str, Any] = {
     "enabled": True,
@@ -806,7 +834,14 @@ class GuardianConfig:
             if action not in VALID_LEVEL_ACTIONS:
                 issues.append(f"lifecycle.levels[{i}].action={action!r} 非法，回退 none")
                 action = "none"
+            # `__template_key` 必须**原样带过去**。下面这个 dict 是白名单式重建，
+            # 一旦不带上它，用户在 WebUI 里保存一次，磁盘上的等级就会全部变成
+            # "找不到对应模板，请删除后重新添加"——数据还在，但前端再也渲染不出来。
+            # 缺失时（老版本写下的配置）在这里补齐，等于自动修复，用户不必手工
+            # 删条目重加。沿用条目自带的键，兼容以后新增模板类型。
             cleaned.append({
+                "__template_key": str(
+                    lv.get("__template_key") or lv.get("template") or LEVEL_TEMPLATE_KEY),
                 "id": str(lv.get("id") or f"L{i}"),
                 "name": str(lv.get("name") or f"等级 {i}"),
                 "after_hours": after,

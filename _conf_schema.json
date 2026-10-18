@@ -462,6 +462,7 @@
         "type": "template_list",
         "default": [
           {
+            "__template_key": "level",
             "id": "L0",
             "name": "常规",
             "after_hours": 0,
@@ -469,6 +470,7 @@
             "action": "none"
           },
           {
+            "__template_key": "level",
             "id": "L1",
             "name": "I 级 · 轻提醒",
             "after_hours": 168,
@@ -476,6 +478,7 @@
             "action": "notify"
           },
           {
+            "__template_key": "level",
             "id": "L2",
             "name": "II 级 · 建议休息",
             "after_hours": 360,
@@ -483,6 +486,7 @@
             "action": "notify"
           },
           {
+            "__template_key": "level",
             "id": "L3",
             "name": "III 级 · 准备睡眠",
             "after_hours": 600,
@@ -490,6 +494,7 @@
             "action": "arm_sleep"
           },
           {
+            "__template_key": "level",
             "id": "L4",
             "name": "IV 级 · 强制睡眠",
             "after_hours": 720,
