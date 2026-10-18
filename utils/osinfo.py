@@ -100,6 +100,7 @@ def detect_os(open_file, path_exists) -> dict[str, Any]:
         "os": "unknown",
         "name": "",
         "version": "",
+        "kernel": "",
         "id": "",
         "like": [],
         "pretty": "",
@@ -108,8 +109,12 @@ def detect_os(open_file, path_exists) -> dict[str, Any]:
     if platform is not None:
         try:
             info["os"] = canonical_os(platform.system())
-            # `version` 在无 os-release 时兜底为内核版本
-            info["version"] = str(platform.release() or "")
+            # `kernel` 是**独立字段**，绝不能被发行版版本号覆盖：Debian 的
+            # `VERSION_ID` 是 "13"，若把它塞进 `version` 再当内核用，就会报出
+            # "内核 13"这种错值（本 bug 在 trixie 容器上实测复现）。
+            info["kernel"] = str(platform.release() or "")
+            # `version` 仅在无 os-release 时兜底为内核版本（老旧/精简镜像）
+            info["version"] = info["kernel"]
         except Exception:  # noqa: BLE001 —— 采集失败只能是"信息缺失"，不能影响巡检
             logger.debug("[guardian] platform.system/release 失败", exc_info=True)
 

@@ -86,7 +86,9 @@ def collect_env() -> dict[str, Any]:
         "os_id": str(info.get("id") or ""),
         "os_like": list(info.get("like") or []),
         "distro": pretty_name(info),
-        "kernel": str(info.get("version") or ""),
+        # 内核取 `info["kernel"]`（`platform.release()`），**不是** `info["version"]`：
+        # 后者是发行版 `VERSION_ID`（Debian 13 → "13"），当内核用会报出假内核版本。
+        "kernel": str(info.get("kernel") or ""),
         "arch": str(machine or ""),
         "libc": platform.libc_ver()[0] if platform is not None else "",
         "python": platform.python_version() if platform is not None else "",
