@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import time
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 # 触发探针/动作注册（import 副作用）
@@ -176,11 +177,23 @@ class GuardianKernel:
             f"数据目录={self.data_dir}")
         for w in self._safety_warnings:
             logger.warning(f"[guardian] 启动告警：{w}")
+        # 宿主看门狗自检（M0）：请求投递链断了的话，面板会显示"已提交"但其实
+        # 容器没睡。这一条必须显式告警，否则失败完全是静默的。
+        watchdog_warning = self._check_watchdog()
+        if watchdog_warning:
+            logger.warning(f"[guardian] 启动告警：{watchdog_warning}")
+            self._safety_warnings.append(watchdog_warning)
+            self.audit.append(kind="watchdog.unhealthy", detail=watchdog_warning, ok=False)
+        else:
+            self.audit.append(kind="watchdog.healthy", detail="宿主看门狗就绪", ok=True)
         if self.config.notify.umo_list:
             await self.notifier.push(
                 f"[守护] 守护系统已启动（模式 {self.state.get('mode')}，"
                 f"档位 {self.state.get('profile')}）",
                 severity=Severity.INFO, force=True)
+        if watchdog_warning and self.config.notify.umo_list:
+            await self.notifier.push(
+                f"[守护] {watchdog_warning}", severity=Severity.WARN, force=True)
 
     async def stop(self) -> None:
         if not self._started:
@@ -573,6 +586,64 @@ class GuardianKernel:
         """由适配层在收到任意消息时调用（供 QQ 活跃度证据）。"""
         self.state.set("last_event_ts", time.time())
         self.state.set("last_event_age", 0.0)
+
+    # ================================================================== #
+    # 宿主看门狗自检
+    # ================================================================== #
+    WATCHDOG_STALE_SEC = 300.0        # 账本 5 分钟没动过 = 看门狗没在跑
+
+    def _watchdog_state_path(self) -> Path | None:
+        """看门狗账本在插件可见范围内的路径。
+
+        请求/结果文件与账本同目录（见 `deploy/guardian-watchdog.py` 的
+        `Config.state`），所以由 `watchdog_request_path` 推出来即可，不需要
+        再加一个配置项。
+        """
+        request = (self.config.safety.watchdog_request_path or "").strip()
+        if not request:
+            return None
+        explicit = (self.config.safety.watchdog_result_path or "").strip()
+        base = Path(explicit).parent if explicit else Path(request).parent
+        return base / "watchdog_state.json"
+
+    def _check_watchdog(self, now: float | None = None) -> str:
+        """检查宿主看门狗是否真的在跑；返回告警文本（空串表示健康）。
+
+        **为什么必须自检**：插件把请求文件写出去之后只能"相信"宿主会消费它。
+        如果看门狗没装、路径对不上、或者容器名不在白名单里，请求会被静默丢弃，
+        面板却显示"已提交睡眠"——这是这个项目里最容易骗过自己的失败模式。
+        所以启动时做一次廉价的存在性 + 新鲜度检查。
+
+        判定：
+          * 不是 watchdog 策略 → 不检查（返回空串）
+          * `allow_self_restart=false` → 只提示"本体不参与睡眠"，不算故障
+          * 账本缺失 / 超过 5 分钟没更新 → 视为未运行
+
+        本方法**不抛异常**，也**不阻断启动**：看门狗缺失只影响"真睡眠"，
+        不影响巡检与告警。
+        """
+        safety = self.config.safety
+        if str(getattr(safety, "self_restart_strategy", "") or "") != "watchdog":
+            return ""
+        if not bool(getattr(safety, "allow_self_restart", False)):
+            # 本体不参与睡眠时，看门狗只服务内核守护，缺了也不影响睡眠语义。
+            return ""
+
+        path = self._watchdog_state_path()
+        if path is None:
+            return "未配置 watchdog_request_path，本体睡眠请求无处投递"
+
+        now = time.time() if now is None else now
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return (f"未检测到宿主看门狗（{path} 不存在），本体睡眠将无法执行；"
+                    f"请运行 deploy/install-watchdog.sh 或 install-watchdog.ps1")
+        age = now - mtime
+        if age > self.WATCHDOG_STALE_SEC or age < -self.WATCHDOG_STALE_SEC:
+            return (f"宿主看门狗疑似已停止（{path} 已 {age / 60:.0f} 分钟未更新），"
+                    f"本体睡眠将无法执行")
+        return ""
 
 
 # 兼容别名：旧代码/测试按 GuardianRuntime 引用内核本体时仍可用。

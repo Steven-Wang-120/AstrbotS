@@ -1,5 +1,7 @@
 # Host watchdog: one tick per invocation, including saved wake deadlines.
-# Install guardian-watchdog.sh and guardian-watchdog.py together in /usr/local/bin.
+# Prefer `sudo ./install-watchdog.sh`, which fills in the real compose directory,
+# the real container names and the data root by asking `docker compose ps`.
+# The `Environment=` lines below are only defaults for a hand-written install.
 [Unit]
 Description=Guardian Host Watchdog (Docker restart and timed sleep)
 Documentation=file:/usr/local/bin/guardian-watchdog.py
@@ -9,7 +11,9 @@ Requires=docker.service
 [Service]
 Type=oneshot
 TimeoutStartSec=40min
+EnvironmentFile=-/etc/guardian/guardian-watchdog.env
 Environment=GUARDIAN_COMPOSE_DIR=/opt/astrbot-stack
+Environment=GUARDIAN_DATA_ROOT=/opt/astrbot-stack/data
 Environment="GUARDIAN_ALLOWED_TARGETS=astrbot napcat"
 Environment=GUARDIAN_MAX_AGE_SEC=120
 # 域 C 内核心跳守护（B16 §4 / §9 M4）：内核卡死或适配层请求重载时，

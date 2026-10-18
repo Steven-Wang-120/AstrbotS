@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 """Host-owned Docker restart/sleep watchdog (stdlib; Linux and Windows).
 
-Linux: install beside guardian-watchdog.sh and run the systemd oneshot timer.
-Windows: run python guardian-watchdog.py --poll-interval 30 in the foreground.
+Install it with the bundled installer, which discovers the real compose project
+directory and container names, then writes `guardian-watchdog.env`:
+
+  Linux    sudo ./install-watchdog.sh            (systemd timer, every 30s)
+  Windows  powershell -ExecutionPolicy Bypass -File .\\install-watchdog.ps1
+                                                 (scheduled task, every 30s)
+
+Manual run: `python guardian-watchdog.py --poll-interval 30` in the foreground.
 The default is one tick; sleeping jobs never block a oneshot invocation.
 """
 
@@ -111,15 +117,31 @@ def truthy(value):
     return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
 
 
+def default_data_root(compose_dir):
+    """宿主机侧 `./data` 目录。
+
+    插件（容器内）写的是 `/AstrBot/data/guardian/...`，而 compose 示例把
+    `./data` 挂到 `/AstrBot/data`（见 deploy/docker-compose.yml）。所以宿主侧
+    的落点就是 `<compose_dir>/data/guardian/`。历史上这里少写了这一段，导致
+    请求文件写出去无人消费，且**失败是静默的**。安装脚本会显式传
+    `GUARDIAN_DATA_ROOT` 覆盖，默认值只作兜底。
+    """
+    return Path(compose_dir) / "data"
+
+
 class Config:
     def __init__(self, env=None):
         env = os.environ if env is None else env
         self.compose_dir = env.get("GUARDIAN_COMPOSE_DIR", "/opt/astrbot-stack")
-        data_dir = Path(self.compose_dir) / "data" / "guardian"
+        self.data_root = Path(env.get("GUARDIAN_DATA_ROOT") or default_data_root(self.compose_dir))
+        data_dir = self.data_root / "guardian"
         self.request = Path(env.get("GUARDIAN_REQUEST_FILE", str(data_dir / "restart_request.json")))
         self.result = Path(env.get("GUARDIAN_RESULT_FILE", str(data_dir / "restart_result.json")))
         self.log = Path(env.get("GUARDIAN_LOG_FILE", "/var/log/guardian-watchdog.log"))
-        self.allowed = set(env.get("GUARDIAN_ALLOWED_TARGETS", "astrbot napcat").split())
+        # 容器名由安装脚本按 `docker compose ps` 的真实结果写入；默认值只是
+        # compose 示例里的名字，不能假设用户一定照抄。
+        allowed = env.get("GUARDIAN_ALLOWED_TARGETS", "astrbot napcat")
+        self.allowed = {item for item in re.split(r"[\s,]+", allowed) if item}
         self.max_age = float(env.get("GUARDIAN_MAX_AGE_SEC", "120"))
         self.timeout = float(env.get("GUARDIAN_CMD_TIMEOUT", "120"))
         self.backend = env.get("GUARDIAN_DOCKER_BACKEND", "compose")
