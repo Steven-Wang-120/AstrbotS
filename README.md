@@ -110,7 +110,7 @@ AstrBot 通常已内置；缺失时会按 `requirements.txt` 自动安装。
 2. 先用 `profile=maintenance` 跑一次 `/guardian check`：maintenance 档位暂停自动
    动作，只出巡检结论，可在不产生任何副作用的前提下核对判据。
 3. 确认巡检结论正确后把档位调回 `normal`。若还想再稳一轮，可把
-   `safety.allowed_containers` 先留空（所有自动重启都会被拒绝），观察几天日志里
+   `containers.managed` 先留空（所有自动重启都会被拒绝），观察几天日志里
    被拒绝的理由，再放开。
 4. 本体自重启另需 `safety.allow_self_restart: true` +
    `safety.self_restart_strategy: "watchdog"` + 看门狗已运行（见 §7）。
@@ -296,7 +296,7 @@ astrbot_plugin_guardian/        ← 仓库根 = 插件根
 **Q：想先「只看不动手」试跑一段时间怎么办？**
 把 `profile` 设为 `maintenance`：该档位暂停周期巡检与所有自动动作，但
 `/guardian check` 仍可手动跑并出完整结论。若既要继续周期巡检、又不想真的动手，
-把 `safety.allowed_containers` 留空——所有自动重启都会以「不在动作白名单内」被拒，
+把 `containers.managed` 留空——所有自动重启都会以「不在动作白名单内」被拒，
 审计里能看到完整的拒绝理由。观察满意后再放开。
 
 ---

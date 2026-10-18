@@ -32,47 +32,52 @@
       "socket_path": {
         "description": "Docker socket 路径",
         "type": "string",
-        "default": "/var/run/docker.sock"
+        "default": "",
+        "hint": "留空自动探测（DOCKER_HOST 优先）"
       },
       "api_version": {
         "description": "Docker Engine API 版本",
         "type": "string",
-        "default": "v1.44",
-        "hint": "启动时会自动协商，失败则沿用此值"
+        "default": "",
+        "hint": "留空自动协商"
       },
       "use_cli_fallback": {
         "description": "socket 不可用时降级到 docker CLI",
         "type": "bool",
-        "default": false
+        "default": false,
+        "hint": "当前版本未实现 CLI 降级，留默认关闭"
       },
       "cli_path": {
         "description": "docker CLI 路径",
         "type": "string",
-        "default": "docker"
+        "default": "docker",
+        "hint": "仅在上面开启时才有意义"
       },
       "timeout": {
-        "description": "单次请求超时（秒）",
+        "description": "单次请求超时（秒，一般无需修改）",
         "type": "int",
         "default": 10
       }
     }
   },
   "containers": {
-    "description": "容器名配置（填 Docker 容器名，即 container_name，不是 compose 服务名）",
+    "description": "容器名配置",
     "type": "object",
     "items": {
       "astrbot": {
-        "description": "AstrBot 本体容器名（container_name）。本体始终受保护，无需在别处重复",
+        "description": "AstrBot 容器名",
         "type": "string",
-        "default": "astrbot"
+        "default": "astrbot",
+        "hint": "container_name，非 compose 服务名"
       },
       "napcat": {
-        "description": "NapCat 协议端容器名（container_name）",
+        "description": "NapCat 容器名",
         "type": "string",
-        "default": "napcat"
+        "default": "napcat",
+        "hint": "container_name，非 compose 服务名"
       },
       "managed": {
-        "description": "受管容器白名单（可被守护与重启）。需填容器名，漏填会导致所有自动动作被拒",
+        "description": "受管容器白名单（留空则拒绝所有自动重启）",
         "type": "list",
         "default": []
       }
@@ -367,11 +372,6 @@
     "description": "安全约束",
     "type": "object",
     "items": {
-      "allowed_containers": {
-        "description": "允许被动作作用的容器白名单（填容器名；留空则所有自动重启被拒）",
-        "type": "list",
-        "default": []
-      },
       "protected_containers": {
         "description": "额外受保护的容器（本体容器始终受保护，无需在此重复）",
         "type": "list",

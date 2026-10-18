@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from typing import Any
 
 import aiohttp
@@ -19,6 +20,39 @@ from ..core.log import logger
 
 class DockerUnavailable(RuntimeError):
     """daemon/socket 不可达。"""
+
+
+#: 探测 daemon 真实 API 版本**之前**的临时值，以及探测失败时的兜底。
+#: 只用于首次 `/version` 请求（该接口在所有 API 版本下都可用），
+#: 协商成功后立即被 daemon 报告的版本覆盖。
+_FALLBACK_API_VERSION = "v1.44"
+
+#: socket 自动探测顺序。Docker Desktop / 各发行版 / 官方镜像的默认位置不一致，
+#: 写死单一路径会让"换个挂载点就整个守护失效"成为最常见的部署事故。
+_CANDIDATE_SOCKETS = (
+    "/var/run/docker.sock",
+    "/run/docker.sock",
+    "/var/run/docker/docker.sock",          # 少数 NAS / 旧版环境
+    "/run/host-services/docker.proxy.sock",  # Docker Desktop for Mac 容器内代理
+)
+
+
+def resolve_socket_path(configured: str = "") -> str:
+    """确定 docker socket 路径：显式配置 > `DOCKER_HOST` > 探测常见路径。
+
+    全部落空时返回最常见的 `/var/run/docker.sock`——此时 `_request()` 会如实
+    抛 `DockerUnavailable` 并带上路径，比返回空串更好排查。
+    """
+    explicit = (configured or "").strip()
+    if explicit:
+        return explicit
+    host = os.environ.get("DOCKER_HOST", "").strip()
+    if host.startswith("unix://"):
+        return host[len("unix://"):]
+    for path in _CANDIDATE_SOCKETS:
+        if os.path.exists(path):
+            return path
+    return _CANDIDATE_SOCKETS[0]
 
 
 class DockerError(RuntimeError):
@@ -45,10 +79,14 @@ def _demux(data: bytes) -> str:
 
 class DockerClient:
     def __init__(self, socket_path: str = "/var/run/docker.sock",
-                 api_version: str = "v1.44", timeout: float = 10.0,
+                 api_version: str = "", timeout: float = 10.0,
                  use_cli_fallback: bool = False, cli_path: str = "docker") -> None:
-        self.socket_path = socket_path
-        self.api_version = api_version or "v1.44"
+        self.socket_path = resolve_socket_path(socket_path)
+        # 空值 = "尚未协商"：首次请求前由 `negotiate()` 问 daemon 要真实版本。
+        # 这里**不能**塞一个硬编码兜底（旧代码写死 v1.44），否则配置项里的
+        # "留空自动协商"永远不生效，Engine 升级后还会撞版本不兼容。
+        self.api_version = (api_version or "").strip() or _FALLBACK_API_VERSION
+        self._negotiated_version = (api_version or "").strip()
         self.timeout = float(timeout)
         self.use_cli_fallback = bool(use_cli_fallback)
         self.cli_path = cli_path
@@ -125,14 +163,31 @@ class DockerClient:
         return await self._request("GET", "/version")
 
     async def negotiate(self) -> str:
-        """协商 API 版本：优先配置值，失败则回退到 /version 报告的版本。"""
+        """把 API 版本对齐到 daemon 实际报告的版本。
+
+        语义：**能问就问，问不到才用配置值**。`/version` 是唯一在所有 API
+        版本下都稳定的接口（Engine 从不给它加版本前缀），所以在探测阶段用
+        临时版本号请求它是安全的。
+
+        - 配置留空 → 完全由 daemon 决定（推荐，跨 Engine 升级无需改配置）；
+        - 配置有值 → 仍以 daemon 报告为准，但若两者不一致会 warn 一次：
+          配置值写死只会让升级后的部署撞 400 `client is newer/older`。
+        """
         if self._negociated:
             return self.api_version
         try:
             info = await self._request("GET", "/version")
             api = str(info.get("ApiVersion") or "").strip()
             if api:
-                self.api_version = api if api.startswith("v") else f"v{api}"
+                probed = api if api.startswith("v") else f"v{api}"
+                if self._negotiated_version and self._negotiated_version != probed:
+                    logger.warning(
+                        f"[guardian] docker.api_version 配置为 "
+                        f"{self._negotiated_version}，但 daemon 实际为 {probed}；"
+                        "已按 daemon 版本执行（建议将该项留空以自动跟随）")
+                if not self._negotiated_version:
+                    logger.info(f"[guardian] Docker API 版本自动协商为 {probed}")
+                self.api_version = probed
         except (DockerUnavailable, DockerError) as exc:
             logger.debug(f"[guardian] Docker 版本协商失败，沿用 {self.api_version}: {exc}")
         self._negociated = True

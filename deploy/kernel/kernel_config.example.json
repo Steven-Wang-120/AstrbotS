@@ -29,7 +29,6 @@
   },
 
   "safety": {
-    "allowed_containers": ["astrbot", "napcat"],
     "protected_containers": ["astrbot"],
     "action_cooldown_sec": 600,
     "max_actions_per_hour": 6,

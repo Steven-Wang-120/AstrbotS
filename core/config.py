@@ -75,8 +75,11 @@ DEFAULTS: dict[str, Any] = {
     "profile": "normal",
     "check_interval": 60,
     "docker": {
-        "socket_path": "/var/run/docker.sock",
-        "api_version": "v1.44",
+        # 空值 = 自动探测：`DOCKER_HOST` 优先，否则依次试常见 socket 路径。
+        # 写死 `/var/run/docker.sock` 会让"挂载点不同/走 TCP"的部署永远连不上。
+        "socket_path": "",
+        # 空值 = 启动时问 daemon 要真实版本（见 DockerClient.negotiate）。
+        "api_version": "",
         "use_cli_fallback": False,
         "cli_path": "docker",
         "timeout": 10,
@@ -155,7 +158,6 @@ DEFAULTS: dict[str, Any] = {
         "max_per_minute": 10,
     },
     "safety": {
-        "allowed_containers": [],
         # 只列**额外**受保护的容器。本体容器（`containers.astrbot`）由
         # `is_protected()` 无条件保护，不依赖这个列表——所以改名时忘了同步这里，
         # 也不会让本体失去保护（B12 §容器名一致性）。
@@ -235,10 +237,16 @@ VALID_KERNEL_MODES = {"inproc", "ipc", "sidecar"}
 
 #: 已退役的配置键 -> 退役说明。`validate()` 遇到就删键并记一条 issue：
 #: 留着不删会让 WebUI 下次保存把旧键写回，删了不报则运维看不见"开关消失了"。
+#: 注意：能直接删的才放这里。`safety.allowed_containers` 需要在删之前把值
+#: **迁移**进 `containers.managed`，因此单独处理（见 `_migrate_allowed_containers`）。
 RETIRED_KEYS: tuple[tuple[str, str], ...] = (
     ("os_hint", "系统信息改由 env_platform 探针从宿主机侧采集，无需再手填"),
     ("dry_run", "整插件级空跑已取消，配置面不再有该开关"),
 )
+
+#: 与 `containers.managed` 语义完全重复的旧白名单键（`safety.allowed_containers`）。
+#: 保留常量只为迁移逻辑可读；它本身不再参与任何授权判定。
+LEGACY_ALLOWED_CONTAINERS = ("safety", "allowed_containers")
 
 #: B00 §7 用 `sidecar` 描述 D1-a 的部署形态，B16 §9 用 `ipc` 描述适配层的连接方式。
 #: 两者指的是同一件事（"内核不在本进程里"），这里统一到 `ipc` 作为内部规范值，
@@ -361,10 +369,16 @@ class GuardianConfig:
 
     @property
     def action_allowlist(self) -> set[str]:
-        """允许被动作作用的容器白名单（managed ∪ allowed_containers）。"""
+        """允许被动作作用的容器白名单（`containers.managed` 是唯一来源）。
+
+        曾被拆成 `containers.managed` ∪ `safety.allowed_containers` 两份列表，
+        但两者语义完全相同（都是"允许被守护/重启的容器名"），前端因此出现两个
+        必须同时维护、漏填任何一个都静默失效的输入框。现统一收敛到
+        `containers.managed`；`safety.allowed_containers` 已退役，由
+        `validate()` 迁移进 `containers.managed` 并给出可见告警。
+        """
         managed = self._names("containers", "managed")
-        allowed = self._names("safety", "allowed_containers")
-        return {x.strip() for x in (managed + allowed) if x.strip()}
+        return {x.strip() for x in managed if x.strip()}
 
     @property
     def self_container(self) -> str:
@@ -435,6 +449,41 @@ class GuardianConfig:
         return max(5, base)
 
     # -- 校验 -------------------------------------------------------------- #
+    def _migrate_allowed_containers(self, issues: list[str]) -> None:
+        """把已退役的 `safety.allowed_containers` 合并进 `containers.managed`。
+
+        两份列表的语义都是"允许被动作作用的容器名"，历史上 `action_allowlist`
+        取二者并集，于是运维必须同时维护两个输入框、漏填一个就静默丢失白名单。
+        现在只认 `containers.managed`：
+
+        - 旧键有值 → 去重合并进 `containers.managed`，**不丢任何名字**；
+        - 合并完删掉旧键，否则 WebUI 下次保存会把复选框/列表再写回来；
+        - 记一条 issue，让"列表搬家了"这件事在日志里可见。
+        """
+        section, key = LEGACY_ALLOWED_CONTAINERS
+        block = self.raw.get(section)
+        if not isinstance(block, dict) or key not in block:
+            return
+        legacy = block.pop(key, None)
+        names = [str(x).strip() for x in (legacy or []) if str(x).strip()]
+        if not names:
+            issues.append(
+                "safety.allowed_containers 已退役并移除（与 containers.managed "
+                "语义重复）；该键为空，无需迁移")
+            return
+        containers = self.raw.get("containers")
+        if not isinstance(containers, dict):
+            containers = {}
+            self.raw["containers"] = containers
+        merged = [x.strip() for x in (containers.get("managed") or [])
+                  if str(x).strip()]
+        added = [n for n in names if n not in merged]
+        containers["managed"] = list(dict.fromkeys(merged + added))
+        issues.append(
+            "safety.allowed_containers 已退役并移除（与 containers.managed 语义"
+            f"重复）；原值 {names} 已并入 containers.managed"
+            + (f"（新增 {added}）" if added else "（无新增）"))
+
     def validate(self) -> list[str]:
         """校验并就地修正非法配置。返回问题列表（空表示全部合法）。"""
         issues: list[str] = []
@@ -453,6 +502,11 @@ class GuardianConfig:
             if key in raw:
                 raw.pop(key, None)
                 issues.append(f"{key} 已退役并移除（{note}）")
+
+        # `safety.allowed_containers` 与 `containers.managed` 语义重复，前后端都
+        # 只保留后者。迁移必须先于白名单校验：否则老部署升级后 `managed` 为空，
+        # 会瞬间落进"动作白名单为空 → 所有自动重启被拒"的降级态。
+        self._migrate_allowed_containers(issues)
 
         if raw.get("mode") not in VALID_MODES:
             issues.append(f"mode={raw.get('mode')!r} 非法，回退 server")
@@ -742,9 +796,9 @@ class GuardianConfig:
 
         if not allow:
             issues.append(
-                "动作白名单为空（containers.managed / safety.allowed_containers 均为空），"
+                "动作白名单为空（containers.managed 未填），"
                 f"所有自动重启将被拒绝；本部署需要放行的容器是 {self.all_containers}，"
-                "请把它们填入 containers.managed 或 safety.allowed_containers")
+                "请把它们填入 containers.managed")
         else:
             # 白名单非空、但漏了本部署实际要守护的容器 —— 点名说清楚，别让用户
             # 只看到一条"某个动作被拒绝"的运行时日志（B12 §容器名一致性）。
@@ -753,8 +807,7 @@ class GuardianConfig:
                 issues.append(
                     f"动作白名单未包含容器 {missing}（本部署的容器名来自 "
                     "containers.astrbot / containers.napcat）；这些容器上的自动重启"
-                    "与睡眠会被拒绝。如非有意，请把它们加入 containers.managed "
-                    "或 safety.allowed_containers")
+                    "与睡眠会被拒绝。如非有意，请把它们加入 containers.managed")
 
         self._issues = issues
         self._d = _to_attr(self.raw)

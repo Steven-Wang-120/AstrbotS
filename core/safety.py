@@ -21,7 +21,7 @@ CONTAINER_KINDS = {"restart_container", "start_container", "sleep"}
 READONLY_KINDS = {"notify", "set_profile", "set_mode", "diagnose", "report"}
 
 # 目标名不是容器、而是逻辑目标的动作 kind。
-# 这类动作不能拿容器名白名单（containers.managed / safety.allowed_containers）去卡，
+# 这类动作不能拿容器名白名单（containers.managed）去卡，
 # 否则 Default 配置下会被判 "not_allowlisted" 而永远无法执行——QQ 自动重登正是如此。
 #   qq_relogin  -> target 为 "qq"，实际作用对象由 qq.relogin_method 决定
 #   ros2_restart -> target 为 ROS2 节点名，实际作用命令由 ros2.node_restart_commands 决定
@@ -242,7 +242,7 @@ class SafetyGuard:
             if action.target not in allow:
                 return Decision(
                     False, False,
-                    f"目标 {action.target} 不在动作白名单内（managed ∪ allowed_containers）",
+                    f"目标 {action.target} 不在动作白名单内（containers.managed）",
                     "not_allowlisted")
 
             # 受保护容器
