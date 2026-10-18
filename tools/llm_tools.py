@@ -81,6 +81,59 @@ async def lifecycle_status(rt) -> str:
     return await rt.lifecycle_status_text()
 
 
+async def drowsy_status(rt) -> str:
+    """"我困不困"——给**正在对话的模型**喂事实，不喂成品句子。
+
+    为什么这里不像 `health_report` 那样直接返回一段排好版的中文：
+    这条路径的问题来自"用户在跟我聊天时顺口问了一句你困吗"。
+    如果工具自己生成一句"我困了先去睡啦"，模型拿到后只能复述或尴尬地
+    转述，等于一段对话里塞了两张嘴。所以这里只交出事实
+    （困到什么程度、离下一级还差多久、现在能不能睡），
+    由正在说话的模型带着人格自己组织语言。
+
+    同时也**不调 LLM**：内核不碰 provider 是硬约束（I6），
+    且这一轮本来就已经在模型里了，再生成一次纯属浪费。
+    """
+    info = await rt.drowsy_report()
+    if not info:
+        return ("读取不到自己的在线时长（uptime 探针不可信，通常是容器刚启动"
+                "或时钟回拨），所以也说不上困不困。可以如实告诉对方没查到。")
+
+    parts: list[str] = []
+    parts.append(f"当前状态：{info.get('level_name') or info.get('level_id')}"
+                 f"（{info.get('level_id')}），已连续在线 "
+                 f"{info.get('uptime_hours')} 小时")
+    parts.append(f"困倦程度：{info.get('mood')}")
+
+    nxt = str(info.get("next_level_name") or "")
+    gap = str(info.get("next_level_in_text") or "")
+    if nxt and gap:
+        parts.append(f"距离「{nxt}」还有 {gap}")
+
+    if info.get("drowsy"):
+        if info.get("can_sleep_now"):
+            dur = int(info.get("sleep_duration_min") or 0)
+            parts.append(f"现在可以睡（打算睡 {dur} 分钟）" if dur else "现在可以睡")
+        else:
+            why = []
+            if info.get("recent_talk"):
+                why.append("刚刚还有人在说话")
+            if not info.get("in_window"):
+                win = str(info.get("window") or "")
+                why.append(f"还没到作息窗口（{win}）" if win else "还没到作息窗口")
+            parts.append("虽然困，但现在睡不了" + (f"（{'；'.join(why)}）" if why else ""))
+    else:
+        parts.append("现在完全可以继续聊，不困")
+
+    parts.append(f"距硬性上限还剩：{info.get('remaining_text')}")
+    parts.append(f"现在时间：{info.get('now_text')}")
+
+    joined = "\n".join(f"- {p}" for p in parts)
+    return ("（以下是它自己的真实状态数据，仅供参考。要不要说、说多少、"
+            "用什么语气，由你根据人格和当前对话自己决定；"
+            "对方只是随口一问的话，不必把数字全报出来。）\n" + joined)
+
+
 async def list_incidents(rt, limit: int = 10) -> str:
     return await rt.incidents_text(safe_int(limit, 10, low=1, high=50))
 

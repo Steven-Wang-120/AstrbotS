@@ -454,6 +454,14 @@ class GuardianAdapter:
     async def resume_facts(self) -> dict[str, Any]:
         return dict(await self._call("resume_facts") or {})
 
+    async def preview_facts(self, kind: str = "sleep") -> dict[str, Any]:
+        """预览：假设等级已到。只看长什么样，不代表现在真会开口。"""
+        return dict(await self._call("preview_facts", {"kind": kind}) or {})
+
+    async def drowsy_report(self) -> dict[str, Any]:
+        """"我困不困"的结构化事实；空字典 = uptime 不可信，连自己在线多久都不知道。"""
+        return dict(await self._call("drowsy_report") or {})
+
     async def announce_config(self) -> dict[str, Any]:
         return dict(await self._call("announce_config") or {})
 

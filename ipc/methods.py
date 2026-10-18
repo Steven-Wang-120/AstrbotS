@@ -181,6 +181,21 @@ def build_handlers(kernel: Any) -> dict[str, Handler]:
             moment = None
         return _jsonable(kernel.resume_facts(now=moment) or {})
 
+    async def h_preview_facts(p: dict) -> dict:
+        """预览专用：假设等级已到，不看闸门。返回 `{}` 只在 uptime 不可信时。"""
+        kind = _as_str(p.get("kind"), "sleep", limit=16) or "sleep"
+        if kind not in ("sleep", "deferred", "resume"):
+            raise IpcError(E_BAD_REQUEST, "kind 必须是 sleep/deferred/resume")
+        return _jsonable(kernel.preview_facts(kind) or {})
+
+    async def h_drowsy_report(p: dict) -> dict:
+        """"我困不困"。**不带闸门**：任何等级都要有答案。
+
+        返回 `{}` 只在 uptime 探针不可信时——那时连"在线多久"都不知道，
+        编一个困倦程度出来没有意义。
+        """
+        return _jsonable(kernel.drowsy_report() or {})
+
     async def h_announce_config(p: dict) -> dict:
         """主动消息配置 + 三个模板（含"留空回退内置"的解析结果）。"""
         return _jsonable(kernel.announce_config() or {})
@@ -300,6 +315,8 @@ def build_handlers(kernel: Any) -> dict[str, Handler]:
         "sleep_armed": h_sleep_armed,
         "sleepy_facts": h_sleepy_facts,
         "resume_facts": h_resume_facts,
+        "preview_facts": h_preview_facts,
+        "drowsy_report": h_drowsy_report,
         "announce_config": h_announce_config,
         "announce_state": h_announce_state,
         "peer_stats": h_peer_stats,
@@ -340,6 +357,7 @@ METHOD_NAMES = frozenset({
     # 主动消息
     "sleepy_facts", "resume_facts", "announce_config", "announce_state",
     "peer_stats", "claim_announce", "note_unanswered",
+    "preview_facts", "drowsy_report",
 })
 
 #: 会产生真实副作用的 method（服务端超时后**不得重试**，避免重复执行）

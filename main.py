@@ -75,11 +75,18 @@ HELP_TEXT = """== 守护系统 Guardian ==
 /guardian jobs                   查看下次任务计划
 /guardian safety                 查看安全自检结果
 /guardian announce [sleep|deferred|resume]  预览"Bot 现在会怎么说"（不发送）
+/guardian drowsy                 查看"Bot 现在困不困"（就是它被问到时拿到的数据）
 /guardian reset                  复位内核自修复额度（管理员）
 /guardian help                   本帮助
 别名：/守护
 说明：本插件不会根据对话关键词触发任何动作；所有动作来自定时巡检、
 生命周期等级推进或 Bot 自主调用工具。
+
+关于"Bot 困不困"：
+  直接在聊天里问它「你困吗」「还能撑吗」就行，它会调 guardian_drowsy
+  拿到自己的真实状态，再按人格回你。**插件不解析任何关键词**，
+  是否调用工具完全由模型自己判断。这个查看路径只是方便你在后台确认
+  它此刻拿到的是什么数据。
 
 关于"Bot 自己去说要睡了"：
   到达 L3（准备睡眠）且真睡得成、或 L4（强制睡眠）时，Bot 会主动发一条
@@ -244,38 +251,44 @@ class GuardianPlugin(Star):
             logger.warning(f"[guardian] 主动消息循环异常退出: {exc}")
 
     async def _announce_preview(self, args: list[str]) -> str:
-        """生成一条"现在会说的话"给人看，**不发送、不占坑、不改任何状态**。
+        """预览"Bot 现在会说的话"，**不发送、不占坑、不改任何状态**。
 
-        为什么需要它：真触发要等 600 小时 uptime，正常人不会等 25 天去
-        验证一次。没有预览的话，这套功能只能靠"读代码 + 相信"来确认。
+        输出纪律（这是本命令存在的前提）：默认**只输出那句话本身**。
+        不加标题、不加事件键、不加"收件人: xxx"、不加生命周期状态块——
+        那些是运维信息，塞进来就变成"一个 bot 突然开始念排障报告"，
+        而这套功能的全部意义恰恰是让它像人。
 
-        `kind` 可选 sleep / deferred / resume，用来分别检查三个模板；
-        不带参数时依次试，把当前"说得成"的那个打出来。
+        要看内部信息请显式加 `debug`：
+
+            /guardian announce            只给那句话
+            /guardian announce resume     指定要预览哪种事件
+            /guardian announce debug      附带开关/收件人/事件键
+
+        为什么要留预览：真触发要等 600 小时 uptime，正常人不会等 25 天去
+        验证一次；没有它，这套功能只能靠读代码来确认。
         """
         rt = self.runtime
-        want = (args[0].lower() if args else "")
+        want = ""
+        debug = False
+        for a in args:
+            low = a.lower()
+            if low in ("debug", "-v", "--debug"):
+                debug = True
+            elif low in ("sleep", "deferred", "resume"):
+                want = low
+
         cfg = await rt.announce_config()
         peer = await rt.peer_stats()
         umo = str(peer.get("umo") or "")
 
-        lines = [
-            "== 主动消息预览（不会发送）==",
-            f"开关: {cfg.get('mode')} | 睡醒报备: "
-            f"{'开' if cfg.get('post_sleep') else '关'} | "
-            f"没人应上限: {cfg.get('max_unanswered')}",
-            f"收件人: {umo or '(暂无，Bot 没收到过消息)'}"
-            + (f"（{peer.get('place')}）" if peer.get("place") else ""),
-            f"已发言次数(无人应): {peer.get('count')}",
-        ]
-
         candidates: list[dict[str, Any]] = []
         if want in ("", "sleep"):
             f = await rt.sleepy_facts()
-            if f:
+            if f and f.get("kind") == "sleep":
                 candidates.append(f)
-        if want in ("", "deferred"):
+        if want in ("deferred",):
             # deferred 只在 always 模式下才会返回；这里不改配置，
-            # 拿不到就直接说明原因，而不是伪造一次。
+            # 拿不到就如实说，而不是伪造一次。
             f = await rt.sleepy_facts()
             if f and f.get("kind") == "deferred":
                 candidates.append(f)
@@ -284,32 +297,54 @@ class GuardianPlugin(Star):
             if f:
                 candidates.append(f)
 
-        if not candidates:
-            lines.append("")
-            lines.append("今天没有可报备的事件。可能的原因：")
-            lines.append("  - 等级还没到 L3（需要 600 小时 uptime）；")
-            lines.append("  - 不在作息窗口内，且没开 always；")
-            lines.append("  - 最近 10 分钟有人在说话（本次已顺延）；")
-            lines.append("  - 睡醒报备已过期（超过 6 小时）或已发过。")
-            st = await rt.lifecycle_status_text()
-            lines.append("")
-            lines.append(st)
-            return "\n".join(lines)
+        real_hit = bool(candidates)
+        if not real_hit:
+            # 没有真实事件时**仍然生成**：预览的全部意义就是"别等 25 天"，
+            # 早先这里直接回一句"现在没有要说的"，等于在最需要看效果的时候
+            # 把门关上了（用户在 QQ 里敲 announce sleep 就撞在这里）。
+            # 现在走 `preview_facts`：假设等级已到，其余用真实时钟/配置。
+            kind = want or "sleep"
+            fake = await rt.preview_facts(kind)
+            if fake:
+                candidates.append(fake)
 
-        for f in candidates:
-            facts = dict(f)
-            if umo:
-                facts["umo"] = umo
-            lines.append("")
-            lines.append(f"--- {facts.get('kind')} ---")
-            lines.append(f"事件键: {facts.get('event_key')}")
-            try:
-                text = await rt.compose_announce(facts, cfg)
-            except Exception as exc:  # noqa: BLE001
-                lines.append(f"生成失败: {exc}")
-                continue
-            lines.append(text or "(模型没返回内容——检查 provider 与模板配置)")
-        return "\n".join(lines)
+        if not candidates:
+            if not debug:
+                return "现在没有要说的。"
+            st = await rt.lifecycle_status_text()
+            return "\n".join([
+                "现在没有可预览的事件。",
+                "",
+                f"开关: {cfg.get('mode')} | 睡醒报备: "
+                f"{'开' if cfg.get('post_sleep') else '关'} | "
+                f"没人应上限: {cfg.get('max_unanswered')}",
+                f"收件人: {umo or '(暂无，Bot 没收到过消息)'}"
+                + (f"（{peer.get('place')}）" if peer.get("place") else ""),
+                f"已发言次数(无人应): {peer.get('count')}",
+                "",
+                st,
+            ])
+
+        # 只取第一个：正常只会有一个候选，多个时不必把三句话都刷出来。
+        facts = dict(candidates[0])
+        if umo:
+            facts["umo"] = umo
+        try:
+            text = await rt.compose_announce(facts, cfg)
+        except Exception as exc:  # noqa: BLE001
+            return f"（生成失败：{exc}）"
+        if not text:
+            return "（模型没有返回内容，检查 provider 与模板配置）"
+
+        if not debug:
+            return text
+        note = "预览（假设等级已到，未发送）" if facts.get("preview") else "真实事件"
+        return "\n".join([
+            text,
+            "",
+            f"—— {facts.get('kind')} | {facts.get('event_key')} | "
+            f"{note} | 发给 {umo or '(无地址)'} ——",
+        ])
 
     async def _announce_once(self, *, force_kinds: tuple[str, ...] = ()) -> bool:
         """跑一轮：判断 -> 生成 -> 占坑 -> 发送。返回是否真发了。
@@ -455,6 +490,10 @@ class GuardianPlugin(Star):
             # 这是这套功能唯一诚实的自查方式——主动消息的触发条件是
             # 上线 600 小时，正常部署里没人愿意等 25 天去验证一次。
             return await self._announce_preview(args[1:])
+        if sub in ("drowsy", "tired", "sleepy"):
+            # 用户在聊天里问「你困吗」时，模型拿到的就是这段。
+            # 放出来是为了能在后台确认事实层没算错。
+            return await llm_tools.drowsy_status(self.runtime)
         if sub == "status":
             return await rt.status_text()
         if sub == "env":
@@ -579,6 +618,19 @@ class GuardianPlugin(Star):
         当用户问"你运行多久了""什么时候休息""睡眠机制"时调用。
         """
         yield event.plain_result(await llm_tools.lifecycle_status(self.runtime))
+
+    @filter.llm_tool()
+    async def guardian_drowsy(self, event: AstrMessageEvent):
+        """查询自己现在**困不困**。
+
+        当用户随口问"你困吗""困不困""想睡了吗""还能撑吗""你累不累"
+        "什么时候去睡"这类关于**自己状态**的问题时调用。
+
+        也可以在自己不确定该不该提睡觉时先查一下。
+        注意：这个工具只返回状态数据，不返回要说的话——具体怎么回答
+        由你按人格和当下的对话自己决定。
+        """
+        yield event.plain_result(await llm_tools.drowsy_status(self.runtime))
 
     @filter.llm_tool()
     async def guardian_run_check(self, event: AstrMessageEvent, scope: str = "all"):

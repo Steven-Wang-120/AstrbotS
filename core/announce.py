@@ -96,6 +96,12 @@ def _fmt_hours(hours: float | None) -> str:
     return f"{days} 天" if rest_h == 0 else f"{days} 天 {rest_h} 小时"
 
 
+# 对外公开的别名。`engine.drowsy_report()` 等调用方需要同一套刻度来写
+# "离下一级还差 4 天 23 小时"——跨模块引私有名不合适，这里给个正式名字，
+# 实现仍然只有一份。
+fmt_hours = _fmt_hours
+
+
 def now_text(now: float | None = None, tz_offset_h: float = 8.0) -> str:
     """把时间戳写成"10月18日 02:14（周六）"。
 

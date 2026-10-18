@@ -16,7 +16,7 @@ from ..actions.base import get_action
 from ..notify.notifier import Notifier
 from ..utils.textutil import fmt_ts, human_duration, status_icon
 from . import registry  # noqa: F401  触发探针注册
-from .announce import SleepyFacts, now_text
+from .announce import SleepyFacts, fmt_hours, now_text
 from .audit import AuditLog
 from .bus import EventBus
 from .config import DEFAULTS_LIFECYCLE_PROMPTS, GuardianConfig
@@ -528,6 +528,75 @@ class HealthEngine:
             "peer": self.peer_stats(),
         }
 
+    def drowsy_report(self, now: float | None = None) -> dict[str, Any] | None:
+        """"我困不困？"——把当前困倦程度摊成**结构化事实**，不给成品句子。
+
+        与 `sleepy_facts()` 的区别（很关键，别再混）：
+        - `sleepy_facts()` 回答"**要不要主动开口**"，所以它带闸门，L0 就是 `None`。
+        - `drowsy_report()` 回答"**此刻困到什么程度**"，**不带闸门**：
+          任何等级都得有个答案，因为用户随时可能问一句"你困吗"。
+          聊天 bot 被问到时的正确反应是如实说自己现在的状态，而不是
+          "现在没有要说的"。
+
+        也**不调 LLM**：调用方（对话里的模型）正在跟用户说话，事实给它，
+        由它用人格组织语言。内核若自己再生成一段，就会出现"两套话"。
+
+        返回结构全部是可直接读的中文短句或数字，`None` 表示连 uptime 都不可信。
+        """
+        res = self._last_results.get("uptime:system")
+        if res is None or res.status != Status.OK:
+            return None
+        uptime_h = float(res.metrics.get("uptime_hours", 0.0) or 0.0)
+        moment = time.time() if now is None else float(now)
+
+        idx, spec = self.lifecycle_policy.resolve_level(uptime_h)
+        action = str(getattr(spec, "action", "") or "none")
+        level_id = str(getattr(spec, "id", "") or "")
+        level_name = str(getattr(spec, "name", "") or "")
+
+        # 困倦程度：用"离下一级还差多少"来描述，比直接报等级更像人话。
+        # L0/L1/L2 是不困的，语气上应该能听出来"我还没到那份上"。
+        drowsy = action in ("arm_sleep", "force_sleep")
+        nxt = self.lifecycle_policy.next_level(idx)
+        if drowsy:
+            mood = "困了" if action == "arm_sleep" else "困得不行了"
+        elif nxt is not None:
+            mood = "还不困"
+        else:
+            mood = "还不困"
+
+        enabled, start, end, _ = self._circadian_cfg()
+        in_win = self.in_asleep_window(moment)
+        recent_talk = self._recent_talk(moment)
+        remaining = self._remaining_hours(uptime_h)
+
+        can_sleep_now = bool(drowsy and (
+            action == "force_sleep"
+            or self._deferred_too_long(moment)
+            or (in_win and not recent_talk)))
+
+        return {
+            "level_id": level_id,
+            "level_name": level_name,
+            "uptime_hours": round(uptime_h, 2),
+            "mood": mood,
+            "drowsy": drowsy,
+            "now_text": now_text(moment, self._tz_offset_h()),
+            "in_window": in_win,
+            "window": f"{start} - {end}" if enabled else "",
+            "recent_talk": recent_talk,
+            "can_sleep_now": can_sleep_now,
+            "sleep_duration_min": int(self.config.lifecycle.sleep_duration_min or 0),
+            "remaining_hours": remaining,
+            "remaining_text": ("未设置硬上限" if remaining is None
+                               else fmt_hours(remaining)),
+            "next_level_in_text": ("" if nxt is None else
+                                   fmt_hours(getattr(nxt, "after_hours", 0.0) - uptime_h)),
+            "next_level_name": ("" if nxt is None else
+                                str(getattr(nxt, "name", "") or getattr(nxt, "id", ""))),
+            "announce_mode": self.announce_config()["mode"],
+        }
+
     def _announce_key(self, facts: dict[str, Any]) -> str:
         """把一次"事件"折叠成一个稳定标识，用于"这件事说过了吗"。
 
@@ -719,6 +788,114 @@ class HealthEngine:
             return float(self.lifecycle_policy.remaining_to_deadline(uptime_h))
         except Exception:  # noqa: BLE001 - 展示用数字，算不出就当未知
             return None
+
+    def preview_facts(self, kind: str = "sleep",
+                      now: float | None = None) -> dict[str, Any] | None:
+        """给 `/guardian announce` 用的**假设性**事实，无视闸门。
+
+        为什么需要它：`sleepy_facts()` 是决策函数——真实 uptime 是 L0 时它
+        永远返回 `None`。可预览命令的全部意义就是"别等 25 天才知道它会说什么"，
+        复用决策函数等于把预览也锁进同一个 25 天的等待里，这个命令就成了摆设
+        （用户实测 QQ 里敲 `announce sleep` 只得到"现在没有要说的"）。
+
+        所以这里只做一件事：把 uptime **临时假设成刚好触发该等级的值**，
+        其余（时间、作息窗口、时长、目标、剩余额度）全部取真实配置与真实时钟。
+        走的是同一个 `SleepyFacts`，因此模板渲染结果与真实触发时同构。
+
+        绝不写任何状态，也绝不发送。
+        """
+        moment = time.time() if now is None else float(now)
+
+        enabled, start, end, _ = self._circadian_cfg()
+        in_win = self.in_asleep_window(moment)
+        period = f"{start} - {end}" if enabled else ""
+        duration_min = int(self.config.lifecycle.sleep_duration_min or 0)
+        targets = tuple(self.config.lifecycle.sleep_targets or ())
+        now_str = now_text(moment, self._tz_offset_h())
+
+        # 挑一个"刚好能触发"的 uptime：对每个等级试它的 after_hours，
+        # 谁的动作是 arm_sleep/force_sleep 就用谁。都没有就退到 L3 语义。
+        spec = None
+        uptime_h = 0.0
+        for cand in self.lifecycle_policy.levels:
+            act = str(getattr(cand, "action", "") or "none")
+            if act in ("arm_sleep", "force_sleep"):
+                spec = cand
+                uptime_h = float(getattr(cand, "after_hours", 0.0) or 0.0)
+                break
+        if spec is None:
+            uptime_h = float(getattr(self.config.lifecycle, "max_uptime_hours", 720))
+
+        forced = str(getattr(spec, "action", "")) == "force_sleep"
+        hours_to_window = 0.0
+        if enabled and not in_win:
+            lead_min = minutes_until_window(moment, start, end, self._tz_offset_h())
+            hours_to_window = max(0.0, lead_min / 60.0)
+
+        if kind == "deferred":
+            facts = SleepyFacts(
+                kind="deferred",
+                level_id=str(getattr(spec, "id", "") or ""),
+                level_name=str(getattr(spec, "name", "") or ""),
+                uptime_hours=uptime_h,
+                now_text=now_str,
+                period=period,
+                hours_to_window=hours_to_window,
+                in_window=in_win,
+                duration_min=duration_min,
+                targets=targets,
+                remaining_hours=self._remaining_hours(uptime_h),
+                forced=False,
+                defer_reason="对方还在说话" if self._recent_talk(moment)
+                             else ("没到作息窗口" if enabled and not in_win
+                                   else "对方还在说话"),
+                wait_hours=0.6,
+                recent_talk=True,
+                reason="预览：假设此刻被顺延",
+            )
+            data = facts.to_dict()
+            data["template_key"] = "sleepy_deferred_prompt"
+            data["event_key"] = self._announce_key(data)
+            data["preview"] = True
+            return data
+
+        if kind == "resume":
+            facts = SleepyFacts(
+                kind="resume",
+                level_id=str(self.lifecycle_state.level_id or ""),
+                level_name=str(self.lifecycle_state.level_name or ""),
+                uptime_hours=0.05,
+                now_text=now_str,
+                slept_minutes=duration_min or 180,
+                reason="预览：假设刚睡醒",
+            )
+            data = facts.to_dict()
+            data["template_key"] = "resume_prompt"
+            data["event_key"] = self._announce_key(data)
+            data["preview"] = True
+            return data
+
+        facts = SleepyFacts(
+            kind="sleep",
+            level_id=str(getattr(spec, "id", "") or "L3"),
+            level_name=str(getattr(spec, "name", "") or "准备睡眠"),
+            uptime_hours=uptime_h,
+            now_text=now_str,
+            period=period,
+            hours_to_window=hours_to_window,
+            in_window=in_win,
+            duration_min=duration_min,
+            targets=targets,
+            remaining_hours=self._remaining_hours(uptime_h),
+            forced=forced,
+            recent_talk=False,
+            reason="预览：假设此刻等级已到、且睡得成",
+        )
+        data = facts.to_dict()
+        data["template_key"] = "sleepy_prompt"
+        data["event_key"] = self._announce_key(data)
+        data["preview"] = True
+        return data
 
     async def _lifecycle_tick(self, trigger: str) -> None:
         res = self._last_results.get("uptime:system")

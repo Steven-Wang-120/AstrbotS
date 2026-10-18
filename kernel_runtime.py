@@ -546,6 +546,15 @@ class GuardianKernel:
     def resume_facts(self, now: float | None = None) -> dict[str, Any] | None:
         return self.engine.resume_facts(now=now)
 
+    def preview_facts(self, kind: str = "sleep",
+                      now: float | None = None) -> dict[str, Any] | None:
+        """预览专用：假设等级已到，返回能渲染的事实（只读、不发送）。"""
+        return self.engine.preview_facts(kind=kind, now=now)
+
+    def drowsy_report(self, now: float | None = None) -> dict[str, Any] | None:
+        """"我困不困"的结构化事实（只读、不带闸门、不调 LLM）。"""
+        return self.engine.drowsy_report(now=now)
+
     def peer_stats(self) -> dict[str, Any]:
         return self.engine.peer_stats()
 
