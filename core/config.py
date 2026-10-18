@@ -220,6 +220,21 @@ DEFAULTS: dict[str, Any] = {
         "post_sleep_notify": True,
         "levels": DEFAULT_LEVELS,
     },
+    # Bot 的作息（**不是用户的作息**）。窗口只做闸门，不做触发器：
+    # 困意（uptime → Ln）决定"该不该睡"，这里决定"能不能睡"。
+    "circadian": {
+        "enabled": True,
+        # asleep 窗口：Bot 表现为"困"、且允许重启本体的时段。
+        # 左闭右开；支持跨零点（如 23:00–07:00）。
+        "asleep_start": "02:00",
+        "asleep_end": "07:00",
+        # 顺延上限：超过这个时长无视窗口强制执行，防止死锁。
+        # 没有它的话"深夜一直有人聊天"会让睡眠永远排不上队，
+        # `lifecycle.max_uptime_hours` 的保证就被架空了。
+        "max_defer_hours": 12,
+        # 窗口内最近多少分钟有人说话就再等等
+        "quiet_minutes": 10,
+    },
     "kernel": {
         # M2：inproc（同进程，M1 旧形态，回滚路径）| ipc（走 IPC）
         "mode": "inproc",
@@ -302,6 +317,18 @@ def _parse_hhmm(value: str) -> tuple[int, int] | None:
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         return None
     return hour, minute
+
+
+def _hhmm_to_minutes(value: str) -> int | None:
+    """`HH:MM` -> 当日分钟数；非法返回 None。
+
+    与 `core/timewindow.py` 的 `parse_hhmm` 语义一致（同样拒绝 `24:00`），
+    但这里只服务于配置校验，不引入 `timewindow` 以保持 config 无依赖。
+    """
+    if not isinstance(value, str):
+        return None
+    parsed = _parse_hhmm(value)
+    return None if parsed is None else parsed[0] * 60 + parsed[1]
 
 #: B00 §7 用 `sidecar` 描述 D1-a 的部署形态，B16 §9 用 `ipc` 描述适配层的连接方式。
 #: 两者指的是同一件事（"内核不在本进程里"），这里统一到 `ipc` 作为内部规范值，
@@ -703,19 +730,19 @@ class GuardianConfig:
         # B17 §5.2：登录阶梯的时间参数用**钳制**而非"回退默认值"——
         # 用户把超时填大/填小是明确的意图，把它夹到边界比丢掉意图更符合预期
         # （C17 T-01：restart_grace_sec=-5 → 0，login_ready_timeout=99999 → 600）。
-        def clamped(section, key, default, low, high):
+        def clamped(section, key, default, low, high, prefix="qq"):
             value = section.get(key, default)
             try:
                 parsed = float(value)
             except (TypeError, ValueError):
                 parsed = None
             if parsed is None or not math.isfinite(parsed):
-                issues.append(f"qq.{key}={value!r} 非法，回退 {default}")
+                issues.append(f"{prefix}.{key}={value!r} 非法，回退 {default}")
                 section[key] = default
                 return
             fixed = min(max(int(parsed), low), high)
             if fixed != int(parsed):
-                issues.append(f"qq.{key}={int(parsed)} 超出 [{low}, {high}]，已钳制为 {fixed}")
+                issues.append(f"{prefix}.{key}={int(parsed)} 超出 [{low}, {high}]，已钳制为 {fixed}")
             section[key] = fixed
 
         clamped(qq, "restart_grace_sec", 3600, 0, 86400)
@@ -935,6 +962,57 @@ class GuardianConfig:
                     f"动作白名单未包含容器 {missing}（本部署的容器名来自 "
                     "containers.astrbot / containers.napcat）；这些容器上的自动重启"
                     "与睡眠会被拒绝。如非有意，请把它们加入 containers.managed")
+
+        # ---- circadian（作息窗口） ------------------------------------ #
+        # 窗口本身**不是触发器**：它只回答"现在允不允许睡"，"该不该睡"仍由
+        # 困意值（uptime → L0..L4）决定（B15 §6）。因此这里的所有兜底都偏向
+        # "更不容易睡"——配置写错最多让它不睡，绝不能让它错睡。
+        circ = raw.get("circadian")
+        if not isinstance(circ, dict):
+            circ = dict(DEFAULTS.get("circadian") or {})
+            raw["circadian"] = circ
+            issues.append("circadian 配置段非法，已回退默认")
+
+        for key, default in (("asleep_start", "02:00"), ("asleep_end", "07:00")):
+            value = circ.get(key, default)
+            parsed = _parse_hhmm(value) if isinstance(value, str) else None
+            if parsed is None:
+                issues.append(
+                    f"circadian.{key}={value!r} 不是合法 HH:MM，回退 {default}")
+                circ[key] = default
+            else:
+                # 归一化成零填充的 `HH:MM`，运行时不必再处理 `2:0` 这类输入。
+                circ[key] = f"{parsed[0]:02d}:{parsed[1]:02d}"
+
+        # 顺延上限必须存在：没有它，持续的夜间对话会让本体的睡眠无限期推后，
+        # 30 天一次的真睡保证就被聊穿了（施工计划 M4 / D1）。
+        # 用**钳制**而非回退默认：填 999 的人想表达"尽量别睡"，夹到 72 比
+        # 悄悄改回 12 更贴近意图。
+        clamped(circ, "max_defer_hours", 12, 1, 72, prefix="circadian")
+        clamped(circ, "quiet_minutes", 10, 0, 120, prefix="circadian")
+
+        start_min = _hhmm_to_minutes(circ["asleep_start"])
+        end_min = _hhmm_to_minutes(circ["asleep_end"])
+        if start_min is not None and start_min == end_min:
+            # 零长度窗口 = 关闭。这样用户想临时停用它只需把两端填成一样，
+            # 不必再去动 enabled（也避免"enabled=true 但其实从不生效"的困惑）。
+            circ["enabled"] = False
+            issues.append(
+                "circadian.asleep_start 与 asleep_end 相同，作息窗口长度为 0，"
+                "已视为禁用（如需停用请直接把 circadian.enabled 设为 false）")
+        elif start_min is not None and end_min is not None:
+            length = (end_min - start_min) % (24 * 60)
+            if length < 120:
+                issues.append(
+                    f"circadian 作息窗口仅 {length} 分钟（建议不少于 120 分钟）；"
+                    "窗口过短时本体可能来不及睡完就被唤醒，睡眠时长会被 "
+                    "lifecycle.sleep_duration_min 截断")
+
+        # 窗口开着但睡眠功能整体关着 —— 用户大概率是想开却没发现少了一步。
+        if circ.get("enabled") and not raw.get("lifecycle", {}).get("enabled"):
+            issues.append(
+                "circadian.enabled=true 但 lifecycle.enabled=false，"
+                "作息窗口不会生效（困意值不运行就没有睡眠意图）")
 
         self._issues = issues
         self._d = _to_attr(self.raw)

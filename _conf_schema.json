@@ -560,6 +560,42 @@
       }
     }
   },
+  "circadian": {
+    "description": "作息窗口（只决定「此刻允不允许睡」，不决定「该不该睡」）",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "启用作息窗口约束",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后困意到了就会立即睡，不再等待合适的时段"
+      },
+      "asleep_start": {
+        "description": "允许入睡时刻（HH:MM，本地时间）",
+        "type": "string",
+        "default": "02:00",
+        "hint": "支持跨午夜，例如 23:30 → 07:00"
+      },
+      "asleep_end": {
+        "description": "应当醒来时刻（HH:MM，本地时间）",
+        "type": "string",
+        "default": "07:00",
+        "hint": "与入睡时刻填相同值 = 禁用窗口"
+      },
+      "max_defer_hours": {
+        "description": "最多顺延（小时）",
+        "type": "int",
+        "default": 12,
+        "hint": "超过这个时长仍未睡，将无视作息窗口强制入睡，保证 30 天必真睡一次"
+      },
+      "quiet_minutes": {
+        "description": "睡前静默（分钟）",
+        "type": "int",
+        "default": 10,
+        "hint": "最近这么多分钟内有对话时不睡，避免打断正在进行的交谈"
+      }
+    }
+  },
   "kernel": {
     "description": "独立内核（B16：内核/适配层/看门狗三域分离）",
     "type": "object",
