@@ -17,6 +17,7 @@ AstrBot 适配层见 `adapter_runtime.py`；`runtime.py` 是兼容壳。
 
 from __future__ import annotations
 
+import asyncio
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -178,6 +179,9 @@ class GuardianKernel:
             f"数据目录={self.data_dir}")
         for w in self._safety_warnings:
             logger.warning(f"[guardian] 启动告警：{w}")
+        # 自动安装宿主看门狗（必须在自检**之前**：装成功了自检就该看到健康账本，
+        # 而不是先报一次"没装"再装好）。
+        install_note = await self._maybe_auto_install_watchdog()
         # 宿主看门狗自检（M0）：请求投递链断了的话，面板会显示"已提交"但其实
         # 容器没睡。这一条必须显式告警，否则失败完全是静默的。
         watchdog_warning = self._check_watchdog()
@@ -195,6 +199,10 @@ class GuardianKernel:
         if watchdog_warning and self.config.notify.umo_list:
             await self.notifier.push(
                 f"[守护] {watchdog_warning}", severity=Severity.WARN, force=True)
+        if install_note and self.config.notify.umo_list:
+            # 只在"动手装过"时推：已装跳过与关闭开关都不刷屏。
+            await self.notifier.push(
+                f"[守护] {install_note}", severity=Severity.INFO, force=True)
 
     async def stop(self) -> None:
         if not self._started:
@@ -622,7 +630,7 @@ class GuardianKernel:
         self.state.set("last_event_age", 0.0)
 
     # ================================================================== #
-    # 宿主看门狗自检
+    # 宿主看门狗自检 / 自动安装
     # ================================================================== #
     WATCHDOG_STALE_SEC = 300.0        # 账本 5 分钟没动过 = 看门狗没在跑
 
@@ -640,6 +648,118 @@ class GuardianKernel:
         base = Path(explicit).parent if explicit else Path(request).parent
         return base / "watchdog_state.json"
 
+    def _host_compose_dir(self) -> str:
+        """宿主机上的 compose 目录（安装脚本要用它反推 data 挂载点）。
+
+        来源优先级：
+          1. 显式配置 `safety.watchdog_compose_dir`（留空则自动探测）
+          2. 本容器的 `com.docker.compose.project.working_dir` 标签 ——
+             compose 自己写进去的，比任何猜测都准
+          3. 放弃（返回空串），让安装脚本自己向上找
+        """
+        explicit = str(
+            getattr(self.config.safety, "watchdog_compose_dir", "") or "").strip()
+        if explicit:
+            return explicit
+        return str(self.state.get("host.compose_dir") or "").strip()
+
+    async def _probe_host_compose_dir(self) -> str:
+        """读本容器的 compose 标签，拿到宿主机上的 project working_dir。
+
+        `com.docker.compose.project.working_dir` 是 compose 自己写进容器的，
+        比按挂载路径反推可靠得多（反推容易在 `./data` 这种相对路径上出错）。
+        拿不到就返回空串，让安装脚本自己去向上找 compose 文件。
+        """
+        name = self.config.self_container
+        try:
+            info = await self.docker.inspect(name)
+        except Exception:  # noqa: BLE001 - 探测失败不该影响启动
+            return ""
+        if not isinstance(info, dict):
+            return ""
+        labels = ((info.get("Config") or {}).get("Labels") or {})
+        if not isinstance(labels, dict):
+            return ""
+        workdir = str(
+            labels.get("com.docker.compose.project.working_dir") or "").strip()
+        if workdir:
+            # 落库，方便运维在 /guardian status 与日志里核对
+            self.state.set("host.compose_dir", workdir)
+        return workdir
+
+    def _deploy_script_path(self) -> Path:
+        """插件自带的安装脚本（随插件分发）。"""
+        return Path(__file__).resolve().parent / "deploy" / "install-watchdog.sh"
+
+    async def _maybe_auto_install_watchdog(self) -> str:
+        """启动时尝试自动安装宿主看门狗。返回给用户看的一句话（空=无需提示）。
+
+        **为什么放在容器里做这件事**：看门狗必须跑在宿主机（它要操作
+        compose），而插件在容器里。两者之间隔着容器边界。能通行的唯一路径是
+        Docker socket —— 这个部署本来就把 socket 挂进来了（插件用它探测
+        容器状态），所以"顺手装个看门狗"是既有能力的延伸，不是新增权限。
+
+        能力边界（必须如实告知，不能假装做到）：
+          * Linux 宿主：能全自动（临时容器挂 `/` 到 `/host`，跑安装脚本）
+          * Windows 宿主：**不能**。Linux 容器里跑不了 `powershell.exe`，
+            注册不了计划任务。此时只给出可复制的手动命令。
+
+        本方法**不抛异常**、**不阻断启动**：装不上最多是"下次还得手动"。
+        """
+        safety = self.config.safety
+        if not bool(getattr(safety, "auto_install_watchdog", False)):
+            return ""
+        if str(getattr(safety, "self_restart_strategy", "") or "") != "watchdog":
+            # 没选 watchdog 策略就不该往宿主机装任何东西。
+            return ""
+        ledger = self._watchdog_state_path()
+        if ledger is None:
+            return ""
+        try:
+            from .core.watchdog_install import already_installed, install
+        except ImportError:
+            return ""
+        if already_installed(str(ledger)):
+            return ""
+
+        script = self._deploy_script_path()
+        if not script.exists():
+            msg = (f"未能自动安装宿主看门狗：插件内缺少 {script.name}"
+                   f"（deploy/ 未随插件打包？）")
+            logger.warning(f"[guardian] {msg}")
+            self.audit.append(kind="watchdog.install", detail=msg, ok=False)
+            return msg
+
+        compose_dir = await self._probe_host_compose_dir() or self._host_compose_dir()
+        # 安装脚本在容器里看不到宿主路径，所以 compose_dir 只用于**日志**与
+        # 传给脚本做参考；真正让脚本工作的是临时容器里的 /host 挂载。
+        logger.info(f"[guardian] 尝试自动安装宿主看门狗 | compose_dir={compose_dir or '(自动探测)'}")
+        res = await asyncio.to_thread(
+            install,
+            deploy_script=str(script),
+            ledger_path=str(ledger),
+            compose_dir_host=compose_dir or "/opt/astrbot-stack",
+            targets=list(self.config.lifecycle.sleep_targets or []),
+        )
+        if res.get("skipped"):
+            self.audit.append(kind="watchdog.install", detail=res.get("reason", ""),
+                              ok=True, suppressed=True)
+            return ""
+        if res.get("ok"):
+            logger.info(f"[guardian] 宿主看门狗自动安装成功：{res.get('reason')}")
+            self.audit.append(kind="watchdog.install", detail=res.get("reason", ""),
+                              ok=True)
+            return f"已在宿主机自动安装看门狗（{res.get('reason')}）"
+
+        # 失败：审计 + 返回可见提示（含可复制的手动命令）
+        reason = str(res.get("reason") or "未知原因")
+        output = str(res.get("output") or "").strip()
+        detail = reason + (f" | 输出：{output[-500:]}" if output else "")
+        logger.warning(f"[guardian] 自动安装宿主看门狗失败：{detail}")
+        self.audit.append(kind="watchdog.install", detail=detail, ok=False)
+        hint = str(res.get("hint") or "").strip()
+        return f"未能自动安装宿主看门狗（{reason}）" + (f"\n{hint}" if hint else "")
+
     def _check_watchdog(self, now: float | None = None) -> str:
         """检查宿主看门狗是否真的在跑；返回告警文本（空串表示健康）。
 
@@ -650,8 +770,14 @@ class GuardianKernel:
 
         判定：
           * 不是 watchdog 策略 → 不检查（返回空串）
-          * `allow_self_restart=false` → 只提示"本体不参与睡眠"，不算故障
-          * 账本缺失 / 超过 5 分钟没更新 → 视为未运行
+          * 账本缺失 / 超过 5 分钟没更新 → 视为未运行，**一律报警**
+          * 但 `allow_self_restart=false` 时改措辞：本体本就不参与睡眠，
+            缺看门狗不影响睡眠语义，属于"配置说得像有、实际没有"的卫生问题
+
+        早期实现是"`allow_self_restart=false` 就直接返回空串"。那会掩盖
+        一个真实且常见的情形：策略填了 `watchdog`、宿主机却没装看门狗。
+        本体此刻确实不睡，所以不算故障；但用户一旦把 `allow_self_restart`
+        打开，睡眠就会静默失败，而此前没有任何提示。宁可现在多说一句。
 
         本方法**不抛异常**，也**不阻断启动**：看门狗缺失只影响"真睡眠"，
         不影响巡检与告警。
@@ -659,24 +785,35 @@ class GuardianKernel:
         safety = self.config.safety
         if str(getattr(safety, "self_restart_strategy", "") or "") != "watchdog":
             return ""
-        if not bool(getattr(safety, "allow_self_restart", False)):
-            # 本体不参与睡眠时，看门狗只服务内核守护，缺了也不影响睡眠语义。
-            return ""
+
+        allow_self = bool(getattr(safety, "allow_self_restart", False))
 
         path = self._watchdog_state_path()
         if path is None:
-            return "未配置 watchdog_request_path，本体睡眠请求无处投递"
+            # 没配请求路径时，即使本体不睡也该提一句：策略选了 watchdog
+            # 却没有任何投递位置，这个组合本身就不成立。
+            return ("safety.self_restart_strategy=watchdog 但未配置 "
+                    "watchdog_request_path，本体睡眠请求无处投递")
 
         now = time.time() if now is None else now
         try:
             mtime = path.stat().st_mtime
         except OSError:
-            return (f"未检测到宿主看门狗（{path} 不存在），本体睡眠将无法执行；"
-                    f"请运行 deploy/install-watchdog.sh 或 install-watchdog.ps1")
+            if allow_self:
+                return (f"未检测到宿主看门狗（{path} 不存在），本体睡眠将无法执行；"
+                        f"请运行 deploy/install-watchdog.sh 或 install-watchdog.ps1")
+            return (f"safety.self_restart_strategy=watchdog，但宿主机上没有看门狗"
+                    f"（{path} 不存在）。当前 allow_self_restart=false，本体不参与"
+                    f"睡眠，因此暂不影响运行；但若将来开启 allow_self_restart，"
+                    f"睡眠会静默失败。可执行 deploy/install-watchdog.ps1 安装")
         age = now - mtime
         if age > self.WATCHDOG_STALE_SEC or age < -self.WATCHDOG_STALE_SEC:
-            return (f"宿主看门狗疑似已停止（{path} 已 {age / 60:.0f} 分钟未更新），"
-                    f"本体睡眠将无法执行")
+            if allow_self:
+                return (f"宿主看门狗疑似已停止（{path} 已 {age / 60:.0f} 分钟未更新），"
+                        f"本体睡眠将无法执行")
+            return (f"宿主看门狗账本已 {age / 60:.0f} 分钟未更新（{path}），"
+                    f"看门狗可能已停止。当前 allow_self_restart=false，本体不参与"
+                    f"睡眠，因此暂不影响运行")
         return ""
 
 

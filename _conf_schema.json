@@ -398,6 +398,16 @@
         "type": "string",
         "default": ""
       },
+      "auto_install_watchdog": {
+        "description": "插件加载时自动把看门狗装到宿主机（仅 Linux 宿主机有效；Windows/macOS 会退化为提示）",
+        "type": "bool",
+        "default": true
+      },
+      "watchdog_compose_dir": {
+        "description": "宿主机上的 compose 目录（留空=从容器标签自动读取，一般不用填）",
+        "type": "string",
+        "default": ""
+      },
       "max_consecutive_failures": {
         "description": "连续失败多少次后降级为只告警",
         "type": "int",

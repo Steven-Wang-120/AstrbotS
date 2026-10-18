@@ -43,8 +43,12 @@ VERSION = _read_version()
 OUT = os.path.join(ROOT, f"{PKG}-{VERSION}.zip")
 
 #: 仓库根上**不属于插件本体**的顶层目录（测试、部署、文档、VCS、缓存）。
+#: `deploy/` **要**随插件走：看门狗安装脚本（install-watchdog.sh）、
+#: 守卫程序（guardian-watchdog.py）和 env 示例都在里面，插件加载时会调用它们
+#: 把看门狗装到宿主机上（见 core/watchdog_install.py）。缺了它们，自动安装只能
+#: 退化成一个"请手动执行"的提示。
 EXCLUDE_DIRS = {
-    "__pycache__", "tests", "deploy", "docs", "src", ".git", ".github",
+    "__pycache__", "tests", "docs", "src", ".git", ".github",
     ".venv", "venv", ".ruff_cache", ".pytest_cache", ".mypy_cache",
     ".idea", ".vscode", ".workbuddy-ai",
 }

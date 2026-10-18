@@ -203,6 +203,13 @@ DEFAULTS: dict[str, Any] = {
         "self_restart_strategy": "watchdog",
         "watchdog_request_path": "/AstrBot/data/guardian/restart_request.json",
         "watchdog_result_path": "",  # 空值：请求目录下的 restart_result.json
+        # 插件启动时尝试在**宿主机**上安装看门狗（Linux 宿主可全自动；
+        # Windows 宿主只能提示手动执行，因为 Linux 容器跑不了 powershell）。
+        # 关掉它就完全不做任何尝试，只做检查与告警。
+        "auto_install_watchdog": True,
+        # 宿主机上的 compose 目录。留空 = 从容器标签
+        # `com.docker.compose.project.working_dir` 自动读取（推荐留空）。
+        "watchdog_compose_dir": "",
         "max_consecutive_failures": 3,
     },
     "lifecycle": {

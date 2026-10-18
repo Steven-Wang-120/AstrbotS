@@ -245,7 +245,34 @@ QQ 掉线后如果会话已过期，`restart_container` 重启多少次都回不
 
 ## 7. 自重启看门狗（可选）
 
-容器内进程不能可靠地自杀重启，需要宿主机上的看门狗代劳：
+容器内进程不能可靠地自杀重启，需要宿主机上的看门狗代劳。
+
+### 7.1 自动安装（Linux 宿主机，默认开启）
+
+插件加载时会**自动**尝试把看门狗装到宿主机上，不需要你手动敲任何命令。
+机制：插件通过已挂载的 `/var/run/docker.sock` 起一个**一次性临时容器**，
+把宿主根挂到 `/host`、`PidMode: host`（`systemctl` 要看得见宿主的 systemd），
+在里面执行 `deploy/install-watchdog.sh`，装完立即删除该容器。
+
+| 配置项 | 默认 | 说明 |
+| --- | --- | --- |
+| `safety.auto_install_watchdog` | `true` | 关掉就完全不动宿主机 |
+| `safety.watchdog_compose_dir` | 空 | 留空=从容器标签 `com.docker.compose.project.working_dir` 自动读 |
+
+行为约定（**宁可明说做不到，也不假装成功**）：
+
+- 已装且账本新鲜 → 跳过，不重复注册；
+- 宿主没有可用镜像（`alpine` / `busybox` / `debian-slim`）→ 失败并给出手动命令，**绝不自动拉镜像**；
+- Docker socket 没挂进容器 → 失败并说明原因；
+- **Windows / macOS 宿主机 → 直接返回手动提示**。Linux 容器无法执行
+  `powershell.exe`，这是平台硬限制，不是没实现。Windows 请执行一次
+  `deploy/install-watchdog.ps1`。
+
+> 安全前提：这一步把宿主根以读写方式临时暴露给一个容器。它不新增权限——
+> 插件本来就能通过 socket 控制所有容器——但它确实是特权操作。
+> 不认可这一点就把 `auto_install_watchdog` 设为 `false`，改为手动安装。
+
+### 7.2 手动安装（Linux）
 
 ```bash
 sudo install -m 755 deploy/guardian-watchdog.sh /usr/local/bin/guardian-watchdog.sh
@@ -290,7 +317,8 @@ astrbot_plugin_guardian/        ← 仓库根 = 插件根
 ├── README.md           * 本文件
 │
 ├── tests/              * 自检套件（不打包）：test_*.py + run_all.sh + _pluginloader.py
-├── deploy/             * 部署资产（不打包）：docker-compose.yml、kernel/Dockerfile、看门狗
+├── deploy/               部署资产（**随插件分发**）：guardian-watchdog.py、
+│                         install-watchdog.{sh,ps1}、systemd unit、docker-compose.yml
 ├── docs/               * 开发文档（不打包，不入库）
 ├── pyproject.toml      * ruff 配置
 ├── build_plugin_zip.py * 打包脚本
