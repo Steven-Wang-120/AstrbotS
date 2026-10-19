@@ -151,7 +151,12 @@ class SleepAction(Action):
         self.engine.lifecycle_policy.on_sleep_done(self.engine.lifecycle_state, time.time())
         self.engine.clear_sleeping(targets)
         self.engine.state.set("lifecycle.state", self.engine.lifecycle_state.to_dict())
-        await self.engine.state.flush(force=True)
+        # 这里**不落盘**：本次睡眠的配额/冷却由 `safety.commit()` 记账，而 commit
+        # 在 `engine.request_sleep()` 里、本函数返回之后才发生（D01 P2）。若在此处
+        # flush，磁盘上会先出现「睡眠已完成」，配额与冷却却还停在内存——进程恰好
+        # 在这个窗口崩掉，冷却就丢了，下一次 tick 可能立刻再睡一次。
+        # 落盘统一收到 commit 之后，与 watchdog 分支（utils/watchdog.py）一致：
+        # 先 commit 再 flush。
         if self.config.lifecycle.post_sleep_notify:
             with contextlib.suppress(Exception):
                 await self.engine.notifier.push("[睡眠] 睡眠流程完成，全部目标已复核运行。", severity=Severity.INFO, force=True)

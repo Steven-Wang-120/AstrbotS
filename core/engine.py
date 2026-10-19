@@ -1081,6 +1081,11 @@ class HealthEngine:
             degraded = self.safety.commit(spec, result.ok)
             await self._note_degradation(degraded, trigger)
         self.state.set("lifecycle.state", self.lifecycle_state.to_dict())
+        # 记账之后才落盘（D01 P2）。顺序不能反：`commit()` 写入的配额/冷却若是
+        # 留在内存里而副作用已经写入磁盘，进程崩一次就把冷却丢了，下一 tick 会
+        # 立刻再睡一次。直连路径的 flush 原先在 `actions/sleep.py` 里、先于
+        # commit 发生；watchdog 路径（`utils/watchdog.py`）本来就是 commit → flush。
+        await self.state.flush(force=True)
         self.audit.append(kind="sleep.execute", target=",".join(targets),
                           detail=result.detail, actor=actor, trigger=trigger,
                           ok=result.ok, elapsed_ms=result.elapsed_ms)

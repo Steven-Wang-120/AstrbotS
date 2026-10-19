@@ -86,7 +86,8 @@ def _fmt_hours(hours: float | None) -> str:
         return "未知"
     if value != value or value < 0:  # NaN 或负数
         return "未知"
-    total_min = int(round(value * 60))
+    # `round()` 在 Python 3 返回 int（value 已被 float() 转过），再套 int() 是冗余。
+    total_min = round(value * 60)
     if total_min < 60:
         return f"{total_min} 分钟"
     hh, mm = divmod(total_min, 60)
