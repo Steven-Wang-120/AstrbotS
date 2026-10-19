@@ -343,6 +343,9 @@ systemctl status guardian-watchdog.timer
 仓库根即插件根。带 `*` 的是**仓库自身**的东西，不随插件包分发
 （打包脚本与 `.dockerignore` 都排除）。
 
+其中 `tests/` 与 `docs/` 更进一步——它们**连版本库都不进**（`.gitignore` 排除），
+只存在于维护者的开发副本里。所以克隆下来的仓库看不到这两个目录，这是设计如此。
+
 ```text
 astrbot_plugin_guardian/        ← 仓库根 = 插件根
 ├── metadata.yaml          *插件元数据（必须在根，AstrBot 据此识别）
@@ -371,11 +374,11 @@ astrbot_plugin_guardian/        ← 仓库根 = 插件根
 ├── README.md           * 本文件
 ├── CHANGELOG.md          版本变更记录（随包分发，用户可直接查这次改了什么）
 │
-├── tests/              * 自检套件（不打包）：test_*.py + run_all.sh + _pluginloader.py
+├── tests/              * 自检套件（**不入库、不打包**，仅维护者本地保留）
 ├── deploy/               部署资产（**随插件分发**）：guardian-watchdog.py、
 │                         install-watchdog.{sh,ps1}、systemd unit、
 │                         guardian-watchdog.{sh,env.example}、docker-compose.yml
-├── docs/               * 开发文档（不打包，不入库）
+├── docs/               * 设计文档（**不入库、不打包**，仅维护者本地保留）
 ├── pyproject.toml      * ruff 配置
 ├── build_plugin_zip.py * 打包脚本
 ├── .dockerignore       * 镜像构建忽略
@@ -415,6 +418,11 @@ astrbot_plugin_guardian/        ← 仓库根 = 插件根
 插件采用三域分离：内核（`core/` `utils/` `actions/` `probes/` `modes/` `ipc/` `kernel/`）
 不 import `astrbot`，适配层（`main.py` `adapter_runtime.py`）才依赖 AstrBot API，
 便于脱离 AstrBot 做纯逻辑自检。
+
+> **`tests/` 与 `docs/` 不随仓库发布。** 本仓库的定位是「整个仓库 = 一个插件」，
+> 只保留运行所需的主程序；开发期的自检套件与设计文档由维护者本地保留
+> （`.gitignore` 中显式排除）。克隆下来的仓库里没有 `tests/`，
+> 下面三条命令只对**持有开发副本**的人有约束力。
 
 跑全部自检（`run_all.sh` 会逐个执行 `tests/test_*.py`）：
 
