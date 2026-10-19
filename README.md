@@ -29,10 +29,13 @@ AstrBot 双模式健康守护插件。面向 **Arch Linux + Docker Compose** 的
 | 内存泄漏防护 | 采集容器内存，滑动窗口 + 最小二乘估算增长速率（MB/小时），超阈值告警，可选自动重启 |
 | ROS2 守护 | 期望节点 / 话题存在性、话题频率、`ros2 doctor`；恢复命令仅来自配置白名单 |
 | 生命周期自主睡眠 | 按容器运行时长分级（阈值前端可配），每级向 Bot 注入不同提示词引导其自主决定休息；30 天硬上限强制真睡眠 |
-| LLM 工具 | 9 个工具供 Bot 自主调用（健康报告、巡检、诊断、事件、睡眠、重启、切模式 / 档位） |
+| 作息窗口 | 困意由运行时长决定，「现在能不能睡」由时段决定；窗口外的自主睡眠会推迟，顺延超上限则无视窗口 |
+| 主动播报 | Bot 到点自己去跟管理员说要睡了 / 我回来了；说什么由 LLM 决定，插件只给判定与事实 |
+| LLM 工具 | 10 个工具供 Bot 自主调用（健康报告、巡检、诊断、事件、困意、睡眠、重启、切模式 / 档位） |
 | 通知 | 推送到指定会话，限流 + 去重 + 档位静默 + 失效 UMO 跳过 |
 | 安全护栏 | 白名单 / 冷却 / 每小时熔断 / 受保护容器 / 参数规范化 / 连续失败降级 |
 | 运行环境自述 | `env_platform` 探针从宿主机侧读取系统 / 内核 / 架构 / 内存 / 时区，无需手填 |
+| 看门狗自带 | 插件携带安装脚本，加载时自动装到 Linux 宿主机；做不到时如实返回手动命令，绝不假装成功 |
 
 ### 自主触发铁律
 
@@ -192,12 +195,16 @@ QQ 掉线后如果会话已过期，`restart_container` 重启多少次都回不
 /guardian status                 # 健康快照（含运行时长与等级）
 /guardian check [scope]          # 立即巡检
 /guardian level                  # 生命周期详情
+/guardian drowsy                 # 此刻困到什么程度（事实层，不影响状态）
+/guardian announce [事件]        # 预览「现在会主动说什么」，不发送（见 §4.3）
+/guardian env                    # 运行环境指纹（系统/内核/架构/内存/时区）
 /guardian sleep [分钟] [原因]    # 立即真睡眠（管理员）
 /guardian login                  # 立即执行一次登录恢复（管理员）
 /guardian webui                  # NapCat WebUI 直达链接（管理员，含 token）
 /guardian mode <server|ros2>     # 切换模式（管理员）
 /guardian profile <p>            # 切换档位（管理员）
 /guardian restart <容器>         # 重启容器（管理员）
+/guardian reset                  # 清零内核自修复额度（管理员，仅 ipc 模式）
 /guardian incidents [n]          # 最近事件
 /guardian diagnose <目标|all>    # 诊断
 /guardian jobs                   # 下次任务计划
@@ -207,13 +214,56 @@ QQ 掉线后如果会话已过期，`restart_container` 重启多少次都回不
 
 别名：`/守护`。
 
+> `/guardian drowsy` 与 `/guardian announce` 的区别：前者回答「我现在困到什么程度」，
+> 任何等级都有答案；后者回答「我现在会不会主动开口」，低等级下本就没有该说的话。
+> 预览命令用的是「假设等级已到」的事实，所以不必真等 25 天 uptime 才能核对模板。
+
 ### 4.2 LLM 工具（Bot 自主调用）
 
-`guardian_health_report` · `guardian_lifecycle_status` · `guardian_run_check` ·
-`guardian_diagnose` · `guardian_list_incidents` · `guardian_request_sleep` ·
-`guardian_restart_container` · `guardian_set_mode` · `guardian_set_profile`
+`guardian_health_report` · `guardian_lifecycle_status` · `guardian_drowsy` ·
+`guardian_run_check` · `guardian_diagnose` · `guardian_list_incidents` ·
+`guardian_request_sleep` · `guardian_restart_container` · `guardian_set_mode` ·
+`guardian_set_profile`
 
-破坏性工具默认要求管理员（`llm_tools.require_admin`），且容器参数必须在白名单内。
+共 10 个。破坏性工具默认要求管理员（`llm_tools.require_admin`），且容器参数必须在白名单内。
+
+> `guardian_drowsy` 只交出**事实**（在线多久、几级、离窗口多远），不调用模型——
+> 用户本来就在跟模型对话，由正在回话的那一轮带人格组织语言。
+> 主动播报（Bot 自己开口）走另一条路，见 §4.3。
+
+### 4.3 主动播报（Bot 到点自己说要睡了）
+
+到点困了，Bot 会主动发一条消息告诉管理员自己要睡了，免得管理员以为它挂了。
+**说什么由 LLM 决定，插件里没有成品句子**——插件只提供「该不该开口」的判定
+和一组结构化事实（在线多久、几级、离窗口多远、这次睡多久、上次为什么没睡成）。
+
+| 配置键 | 默认 | 说明 |
+| --- | --- | --- |
+| `lifecycle.sleepy_announce` | `on_arm` | `off` 关闭 / `on_arm` 只在真睡得成时说（推荐）/ `always` 想睡就说（睡不成也说一声） |
+| `lifecycle.sleepy_announce_max_unanswered` | `3` | 连续这么多次没人回应就暂停主动消息（`0` = 不限制，任一条用户消息立即清零） |
+| `lifecycle.post_sleep_announce` | `true` | 睡醒后说一句「我回来了」（靠事件键去重，超过 6 小时的那次不补报） |
+| `lifecycle.sleepy_prompt` | 空 | 睡前提示词模板，留空用内置 |
+| `lifecycle.sleepy_deferred_prompt` | 空 | 「想睡但没睡成」模板，仅在 `always` 下使用 |
+| `lifecycle.resume_prompt` | 空 | 睡醒报备模板，留空 = 跟着插件升级拿到新文案 |
+
+> 只在 **L3 准备睡眠 / L4 强制睡眠** 时才可能开口。L1、L2 靠对话里的提示词渗透，
+> 不走主动消息。
+
+三类事件：睡前报备（`sleep`）、睡醒报备（`resume`）、「困了但还没睡成」（`deferred`）。
+
+模板支持 14 个占位符：`{{current_time}}` `{{uptime}}` `{{level_id}}` `{{level_name}}`
+`{{remaining}}` `{{duration}}` `{{targets}}` `{{period}}` `{{to_window}}`
+`{{defer_reason}}` `{{wait_text}}` `{{slept}}` `{{forced}}` `{{reason}}`。
+
+防重复用**事件键**（如 `sleep:L3:601`）而不是时间窗口——Bot 说完就去睡，
+睡下后不可能再发第二条，频率限制在这里没有约束对象。
+
+收件人取自 `state.json` 的 `announce.admin_umo` / `announce.last_umo`
+（运行时状态，不是配置项），由消息观察填充，**不读消息内容**。
+`notify.umo_list` 为空时仍能送达。
+
+模板里的花括号**写错会原样留在消息里**——这是刻意不做静默兜底，
+否则关键事实被吞掉也没人发现。
 
 ---
 
@@ -300,31 +350,39 @@ astrbot_plugin_guardian/        ← 仓库根 = 插件根
 ├── kernel_runtime.py      *内核装配（零 astrbot 依赖）
 ├── adapter_runtime.py      AstrBot 侧运行时助手（数据目录解析等）
 ├── runtime.py              兼容壳，转发到 adapter_runtime
-├── __init__.py            *包入口
+├── __init__.py            *包入口（`__version__` 与 metadata 对齐）
 ├── _conf_schema.json      *WebUI 配置 schema
 ├── requirements.txt       *依赖
-├── core/                  models config state audit bus policy safety lifecycle scheduler engine registry log
+├── core/                  models config state audit bus policy safety lifecycle
+│                          scheduler engine registry log
+│                          announce timefmt timewindow watchdog_install
 ├── modes/                 base server ros2 factory
-├── probes/                base docker_probes container_memory qq_login uptime ros2_nodes ros2_topics ros2_doctor
+├── probes/                base docker_probes container_memory qq_login uptime
+│                          env_platform ros2_nodes ros2_topics ros2_doctor
 ├── actions/               base container_actions qq_actions ros2_actions profile_actions sleep
 ├── ipc/                   protocol server client backend methods
 ├── kernel/                __main__ service（`python -m astrbot_plugin_guardian.kernel`）
 ├── notify/                notifier
 ├── tools/                 llm_tools
-├── utils/                 dockerclient napcat shell ros2_runner textutil migration watchdog
+├── utils/                 dockerclient napcat shell ros2_runner textutil migration
+│                          osinfo watchdog
 ├── logo.png            * 插件图标（市场展示用）
 ├── LICENSE             * 许可证
 ├── README.md           * 本文件
+├── CHANGELOG.md          版本变更记录（随包分发，用户可直接查这次改了什么）
 │
 ├── tests/              * 自检套件（不打包）：test_*.py + run_all.sh + _pluginloader.py
 ├── deploy/               部署资产（**随插件分发**）：guardian-watchdog.py、
-│                         install-watchdog.{sh,ps1}、systemd unit、docker-compose.yml
+│                         install-watchdog.{sh,ps1}、systemd unit、
+│                         guardian-watchdog.{sh,env.example}、docker-compose.yml
 ├── docs/               * 开发文档（不打包，不入库）
 ├── pyproject.toml      * ruff 配置
 ├── build_plugin_zip.py * 打包脚本
 ├── .dockerignore       * 镜像构建忽略
 └── .gitignore          *
 ```
+
+> 上面列出的是**模块**文件，每个目录下另有 `__init__.py` 未逐一写出。
 
 > `main.py` 顶部的注释说明为什么不再使用 `@register` 装饰器：AstrBot 自 v3.5.19 起
 > 自动识别继承 `Star` 的类作为插件类，旧装饰器已标记 DEPRECATED。
